@@ -30,10 +30,20 @@ function createTemplate(style: TranslationStyle): HTMLDivElement {
   return wrapper;
 }
 
+function removeStaleSiblingHosts(target: HTMLElement): void {
+  let sibling = target.nextElementSibling as HTMLElement | null;
+  while (sibling?.classList.contains("ai-translator-host")) {
+    const next = sibling.nextElementSibling as HTMLElement | null;
+    sibling.remove();
+    sibling = next;
+  }
+}
+
 export function mountTranslationAfter(
   target: HTMLElement,
   style: TranslationStyle
 ): TranslationMount {
+  removeStaleSiblingHosts(target);
   const host = document.createElement("span");
   host.className = "ai-translator-host";
   host.setAttribute("aria-live", "polite");

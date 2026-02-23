@@ -64,11 +64,25 @@ function isLikelyEnglish(text: string): boolean {
 }
 
 function isElementVisible(element: HTMLElement): boolean {
+  if (
+    element.getAttribute("aria-hidden") === "true" ||
+    Boolean(element.closest('[aria-hidden="true"]'))
+  ) {
+    return false;
+  }
   const style = window.getComputedStyle(element);
-  if (style.display === "none" || style.visibility === "hidden") {
+  if (
+    style.display === "none" ||
+    style.visibility === "hidden" ||
+    style.opacity === "0"
+  ) {
     return false;
   }
   if (element.getClientRects().length === 0) {
+    return false;
+  }
+  const rect = element.getBoundingClientRect();
+  if (rect.width < 2 || rect.height < 2) {
     return false;
   }
   return true;
@@ -93,11 +107,14 @@ export function collectCandidates(root: ParentNode): HTMLElement[] {
       return false;
     }
     // 避免同一段文本被“块元素 + 内联 span”同时命中导致双重翻译。
-    if (
-      element.tagName === "SPAN" &&
-      Boolean(element.closest(BLOCK_TRANSLATABLE_SELECTOR))
-    ) {
-      return false;
+    if (element.tagName === "SPAN") {
+      if (Boolean(element.closest(BLOCK_TRANSLATABLE_SELECTOR))) {
+        return false;
+      }
+      // 避免嵌套 span 链式命中，优先保留最外层可翻译片段。
+      if (Boolean(element.parentElement?.closest("span"))) {
+        return false;
+      }
     }
     if (!isElementVisible(element)) {
       return false;
@@ -136,8 +153,12 @@ export class PageTranslator {
   private unsubscribePort: (() => void) | null = null;
 
   private mutationObserver = new RootMutationObserver((roots) => {
+    const changed = this.pruneDetachedElements();
     for (const root of roots) {
       this.scan(root);
+    }
+    if (changed && roots.length === 0) {
+      this.emitStatus();
     }
   });
 
@@ -316,12 +337,16 @@ export class PageTranslator {
     if (!this.enabled || !this.intersectionObserver) {
       return;
     }
+    this.pruneDetachedElements();
     const candidates = collectCandidates(root);
     for (const element of candidates) {
       if (this.tracked.has(element)) {
         continue;
       }
       const text = normalizeText(element.innerText || element.textContent || "");
+      if (this.hasTrackedSiblingDuplicate(element, text)) {
+        continue;
+      }
       this.tracked.add(element);
       this.elementTexts.set(element, text);
       this.ordered.push(element);
@@ -340,6 +365,10 @@ export class PageTranslator {
     if (this.translated.has(element) || this.queued.has(element)) {
       return;
     }
+    const text = this.elementTexts.get(element);
+    if (text && this.hasActiveSiblingDuplicate(element, text)) {
+      return;
+    }
     const alreadyInflight = Array.from(this.inflight.values()).some(
       (item) => item.element === element
     );
@@ -353,7 +382,11 @@ export class PageTranslator {
   }
 
   private processQueue(): void {
-    if (!this.enabled || !this.port) {
+    if (!this.enabled) {
+      return;
+    }
+    this.pruneDetachedElements();
+    if (!this.port) {
       return;
     }
 
@@ -395,6 +428,114 @@ export class PageTranslator {
     }
 
     this.emitStatus();
+  }
+
+  private pruneDetachedElements(): boolean {
+    let changed = false;
+    const detachedElements = new Set<HTMLElement>();
+
+    const detachElementState = (element: HTMLElement): void => {
+      this.tracked.delete(element);
+      this.translated.delete(element);
+      this.queued.delete(element);
+      this.elementTexts.delete(element);
+      const mount = this.mounts.get(element);
+      if (mount) {
+        mount.remove();
+        this.mounts.delete(element);
+      }
+      detachedElements.add(element);
+      changed = true;
+    };
+
+    for (const element of this.tracked) {
+      if (!element.isConnected) {
+        detachElementState(element);
+      }
+    }
+
+    for (const [requestId, request] of this.inflight) {
+      if (request.element.isConnected) {
+        continue;
+      }
+      this.inflight.delete(requestId);
+      if (!detachedElements.has(request.element)) {
+        detachElementState(request.element);
+      } else {
+        changed = true;
+      }
+    }
+
+    if (!changed) {
+      return false;
+    }
+
+    const filteredOrdered = this.ordered.filter(
+      (element) => element.isConnected && this.tracked.has(element)
+    );
+    this.ordered.splice(0, this.ordered.length, ...filteredOrdered);
+
+    const filteredQueue = this.queue.filter(
+      (element) => element.isConnected && this.tracked.has(element)
+    );
+    this.queue.splice(0, this.queue.length, ...filteredQueue);
+    this.queued.clear();
+    for (const element of this.queue) {
+      this.queued.add(element);
+    }
+
+    return true;
+  }
+
+  private hasTrackedSiblingDuplicate(element: HTMLElement, text: string): boolean {
+    const parent = element.parentElement;
+    if (!parent) {
+      return false;
+    }
+    for (const sibling of Array.from(parent.children)) {
+      if (!(sibling instanceof HTMLElement) || sibling === element) {
+        continue;
+      }
+      if (!this.tracked.has(sibling) || !sibling.isConnected) {
+        continue;
+      }
+      const siblingText =
+        this.elementTexts.get(sibling) ??
+        normalizeText(sibling.innerText || sibling.textContent || "");
+      if (siblingText === text) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  private hasActiveSiblingDuplicate(element: HTMLElement, text: string): boolean {
+    const parent = element.parentElement;
+    if (!parent) {
+      return false;
+    }
+    for (const sibling of Array.from(parent.children)) {
+      if (!(sibling instanceof HTMLElement) || sibling === element) {
+        continue;
+      }
+      if (!this.tracked.has(sibling) || !sibling.isConnected) {
+        continue;
+      }
+      const siblingText = this.elementTexts.get(sibling);
+      if (!siblingText || siblingText !== text) {
+        continue;
+      }
+      if (this.translated.has(sibling) || this.queued.has(sibling)) {
+        return true;
+      }
+      const siblingInflight = Array.from(this.inflight.values()).some(
+        (item) => item.element === sibling
+      );
+      if (siblingInflight) {
+        return true;
+      }
+    }
+    return false;
   }
 
   private getContext(target: HTMLElement): {
