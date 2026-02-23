@@ -21,7 +21,7 @@ export const PROVIDER_PRESETS: Record<ModelProvider, ProviderPreset> = {
   openai: {
     label: "OpenAI",
     baseURL: "https://api.openai.com/v1",
-    model: "gpt-4o-mini",
+    model: "gpt-5-mini",
     apiKeyPlaceholder: "sk-..."
   },
   gemini: {
@@ -63,7 +63,7 @@ export const DEFAULT_USER_CONFIG: UserConfig = {
 
 export const CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 export const CACHE_MAX_ENTRIES = 5000;
-export const DEFAULT_TRANSLATION_CONCURRENCY = 2;
+export const DEFAULT_TRANSLATION_CONCURRENCY = 5;
 export const DEFAULT_SUBTITLE_BATCH_SIZE = 24;
 
 export const UI_SELECTORS = {
