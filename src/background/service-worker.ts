@@ -13,6 +13,7 @@ import type {
   BatchTranslationPayload,
   ConfigTestRequest,
   ModelProvider,
+  ResegmentPayload,
   RuntimeRequestMessage,
   RuntimeResponseMessage,
   TranslationPortIncomingMessage,
@@ -231,6 +232,31 @@ function buildBatchTranslationMessages(
   ];
 }
 
+function buildResegmentMessages(payload: ResegmentPayload): ChatMessage[] {
+  const systemPrompt = [
+    "你是一个字幕断句引擎。",
+    "你会收到自动语音识别生成的字幕片段列表，片段断句不自然且不完整。",
+    "请将片段重新组合为完整、自然的句子。",
+    "严格遵守：",
+    "1. 保留所有原始内容，不添加、不删除、不改写词语。",
+    "2. 只重排断句，不翻译。",
+    "3. 保持原始语言。",
+    "4. 输出必须是合法 JSON 字符串数组。"
+  ].join("\n");
+
+  const userPrompt = [
+    "输入片段(JSON数组):",
+    JSON.stringify(payload.texts),
+    '输出格式示例: ["完整句子1","完整句子2"]',
+    "请开始重排断句。"
+  ].join("\n\n");
+
+  return [
+    { role: "system", content: systemPrompt },
+    { role: "user", content: userPrompt }
+  ];
+}
+
 async function nonStreamChatCompletion(
   config: ProviderApiConfig,
   messages: ChatMessage[]
@@ -307,6 +333,31 @@ function extractJsonObject(text: string): Record<string, string> | null {
   const candidate = trimmed.slice(first, last + 1);
   try {
     return JSON.parse(candidate) as Record<string, string>;
+  } catch (_error) {
+    return null;
+  }
+}
+
+function extractJsonStringArray(text: string): string[] | null {
+  const trimmed = text
+    .trim()
+    .replace(/^```(?:json)?/i, "")
+    .replace(/```$/i, "")
+    .trim();
+  const first = trimmed.indexOf("[");
+  const last = trimmed.lastIndexOf("]");
+  if (first < 0 || last <= first) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(trimmed.slice(first, last + 1)) as unknown;
+    if (!Array.isArray(parsed)) {
+      return null;
+    }
+    const normalized = parsed
+      .map((item) => (typeof item === "string" ? item.trim() : ""))
+      .filter(Boolean);
+    return normalized.length > 0 ? normalized : null;
   } catch (_error) {
     return null;
   }
@@ -666,6 +717,72 @@ async function handleBatchTranslation(
   });
 }
 
+async function handleResegment(
+  port: chrome.runtime.Port,
+  payload: ResegmentPayload
+): Promise<void> {
+  const config = await getUserConfig();
+  if (!config.apiKey.trim()) {
+    safePostMessage(port, {
+      type: "translate:error",
+      payload: {
+        requestId: payload.requestId,
+        message: "请先在设置页填写 API Key。"
+      }
+    });
+    return;
+  }
+
+  const texts = payload.texts
+    .map((item) => item.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+  if (texts.length === 0) {
+    safePostMessage(port, {
+      type: "translate:resegmentDone",
+      payload: {
+        requestId: payload.requestId,
+        sentences: []
+      }
+    });
+    return;
+  }
+
+  try {
+    const messages = buildResegmentMessages({
+      requestId: payload.requestId,
+      texts
+    });
+    const responseText = await nonStreamChatCompletion(
+      {
+        provider: config.provider,
+        apiKey: config.apiKey,
+        baseURL: config.baseURL,
+        model: config.model
+      },
+      messages
+    );
+    const sentences = extractJsonStringArray(responseText);
+    if (!sentences) {
+      throw new Error("字幕重排结果解析失败。");
+    }
+    safePostMessage(port, {
+      type: "translate:resegmentDone",
+      payload: {
+        requestId: payload.requestId,
+        sentences
+      }
+    });
+  } catch (error) {
+    safePostMessage(port, {
+      type: "translate:error",
+      payload: {
+        requestId: payload.requestId,
+        message: error instanceof Error ? error.message : "字幕重排失败。"
+      }
+    });
+  }
+}
+
 chrome.runtime.onConnect.addListener((port) => {
   if (!port.name.startsWith(TRANSLATION_PORT_NAME)) {
     return;
@@ -683,6 +800,11 @@ chrome.runtime.onConnect.addListener((port) => {
 
     if (raw.type === "translate:batch") {
       void handleBatchTranslation(port, raw.payload);
+      return;
+    }
+
+    if (raw.type === "translate:resegment") {
+      void handleResegment(port, raw.payload);
     }
   });
 });

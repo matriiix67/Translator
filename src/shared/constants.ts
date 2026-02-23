@@ -65,6 +65,7 @@ export const CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7;
 export const CACHE_MAX_ENTRIES = 5000;
 export const DEFAULT_TRANSLATION_CONCURRENCY = 5;
 export const DEFAULT_SUBTITLE_BATCH_SIZE = 24;
+export const RESEGMENT_BATCH_SIZE = 120;
 
 export const UI_SELECTORS = {
   popupApp: "#app",

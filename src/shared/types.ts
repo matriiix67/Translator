@@ -69,6 +69,16 @@ export interface BatchTranslationDonePayload {
   translations: Record<string, string>;
 }
 
+export interface ResegmentPayload {
+  requestId: string;
+  texts: string[];
+}
+
+export interface ResegmentDonePayload {
+  requestId: string;
+  sentences: string[];
+}
+
 export interface TranslationErrorPayload {
   requestId: string;
   message: string;
@@ -76,12 +86,14 @@ export interface TranslationErrorPayload {
 
 export type TranslationPortIncomingMessage =
   | { type: "translate:start"; payload: TranslationRequestPayload }
-  | { type: "translate:batch"; payload: BatchTranslationPayload };
+  | { type: "translate:batch"; payload: BatchTranslationPayload }
+  | { type: "translate:resegment"; payload: ResegmentPayload };
 
 export type TranslationPortOutgoingMessage =
   | { type: "translate:chunk"; payload: TranslationChunkPayload }
   | { type: "translate:done"; payload: TranslationDonePayload }
   | { type: "translate:batchDone"; payload: BatchTranslationDonePayload }
+  | { type: "translate:resegmentDone"; payload: ResegmentDonePayload }
   | { type: "translate:error"; payload: TranslationErrorPayload };
 
 export interface TranslationProgress {

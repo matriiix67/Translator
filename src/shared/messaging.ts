@@ -1,6 +1,7 @@
 import { TRANSLATION_PORT_NAME } from "@shared/constants";
 import type {
   BatchTranslationPayload,
+  ResegmentPayload,
   RuntimeRequestMessage,
   RuntimeResponseMessage,
   TranslationPortIncomingMessage,
@@ -36,6 +37,17 @@ export function postBatchTranslation(
 ): void {
   const message: TranslationPortIncomingMessage = {
     type: "translate:batch",
+    payload
+  };
+  port.postMessage(message);
+}
+
+export function postResegment(
+  port: chrome.runtime.Port,
+  payload: ResegmentPayload
+): void {
+  const message: TranslationPortIncomingMessage = {
+    type: "translate:resegment",
     payload
   };
   port.postMessage(message);

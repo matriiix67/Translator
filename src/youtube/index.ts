@@ -1,9 +1,14 @@
-import { DEFAULT_SUBTITLE_BATCH_SIZE, PAGE_BRIDGE_SOURCE } from "@shared/constants";
+import {
+  DEFAULT_SUBTITLE_BATCH_SIZE,
+  PAGE_BRIDGE_SOURCE,
+  RESEGMENT_BATCH_SIZE
+} from "@shared/constants";
 import {
   createRequestId,
   createTranslationPort,
   onPortMessage,
-  postBatchTranslation
+  postBatchTranslation,
+  postResegment
 } from "@shared/messaging";
 import { getSitePreference, getUserConfig, setSitePreference, toSiteKey } from "@shared/storage";
 import type {
@@ -24,6 +29,11 @@ import {
   type CapturedSubtitlePayload,
   type TrackDiscoveryResult
 } from "@youtube/subtitle-fetcher";
+import {
+  buildStageWindowsByPlayback,
+  mapSentencesToRangesOrFallback,
+  type CueSentenceRange
+} from "@youtube/asr-resegment";
 import { SubtitleRenderer } from "@youtube/subtitle-renderer";
 
 const LOG_PREFIX = "[AI Translator]";
@@ -47,6 +57,11 @@ interface PendingBridgeRequest {
 
 interface PendingBatch {
   resolve: (translations: Record<string, string>) => void;
+  reject: (error: Error) => void;
+}
+
+interface PendingResegment {
+  resolve: (sentences: string[]) => void;
   reject: (error: Error) => void;
 }
 
@@ -252,6 +267,8 @@ export class YouTubeSubtitleTranslator {
 
   private readonly pendingBatches = new Map<string, PendingBatch>();
 
+  private readonly pendingResegments = new Map<string, PendingResegment>();
+
   private readonly pendingBridgeRequests = new Map<string, PendingBridgeRequest>();
 
   private currentVideoId: string | undefined;
@@ -272,6 +289,8 @@ export class YouTubeSubtitleTranslator {
   };
 
   private lastError: string | undefined;
+
+  private pendingHint = "翻译中...";
 
   async initialize(): Promise<void> {
     const config = await getUserConfig();
@@ -331,6 +350,7 @@ export class YouTubeSubtitleTranslator {
     this.port?.disconnect();
     this.port = null;
     this.pendingBatches.clear();
+    this.pendingResegments.clear();
     for (const pending of this.pendingBridgeRequests.values()) {
       window.clearTimeout(pending.timeoutId);
     }
@@ -584,19 +604,43 @@ export class YouTubeSubtitleTranslator {
       return;
     }
 
-    if (message.type === "translate:error") {
-      console.error(
+    if (message.type === "translate:resegmentDone") {
+      console.log(
         LOG_PREFIX,
-        "Batch translate error:",
+        "Resegment done:",
         message.payload.requestId,
-        message.payload.message
+        "sentences:",
+        message.payload.sentences.length
       );
-      const pending = this.pendingBatches.get(message.payload.requestId);
+      const pending = this.pendingResegments.get(message.payload.requestId);
       if (!pending) {
         return;
       }
-      this.pendingBatches.delete(message.payload.requestId);
-      pending.reject(new Error(message.payload.message));
+      this.pendingResegments.delete(message.payload.requestId);
+      pending.resolve(message.payload.sentences);
+      return;
+    }
+
+    if (message.type === "translate:error") {
+      console.error(
+        LOG_PREFIX,
+        "Translate pipeline error:",
+        message.payload.requestId,
+        message.payload.message
+      );
+      const pendingBatch = this.pendingBatches.get(message.payload.requestId);
+      if (pendingBatch) {
+        this.pendingBatches.delete(message.payload.requestId);
+        pendingBatch.reject(new Error(message.payload.message));
+        return;
+      }
+
+      const pendingResegment = this.pendingResegments.get(message.payload.requestId);
+      if (!pendingResegment) {
+        return;
+      }
+      this.pendingResegments.delete(message.payload.requestId);
+      pendingResegment.reject(new Error(message.payload.message));
     }
   }
 
@@ -709,6 +753,25 @@ export class YouTubeSubtitleTranslator {
       return;
     }
 
+    const shouldResegment = preferredTrack.kind === "asr" && cues.length >= 5;
+    if (shouldResegment) {
+      console.log(
+        LOG_PREFIX,
+        "ASR track detected, processing by playback stages (resegment+translate)..."
+      );
+      this.cues.splice(0, this.cues.length, ...cues);
+      this.translations.clear();
+      this.lastError = undefined;
+      this.progress.total = cues.length;
+      this.progress.translated = 0;
+      this.progress.inflight = 0;
+      this.progress.pending = cues.length;
+      this.pendingHint = "重排并翻译中...";
+      this.startSync();
+      void this.translateAsrCuesByPlaybackStages(payload.videoId);
+      return;
+    }
+
     console.log(LOG_PREFIX, "[phase:cues_ok]", "count:", cues.length);
     console.log(LOG_PREFIX, "Fetched", cues.length, "cues, starting translation...");
     this.cues.splice(0, this.cues.length, ...cues);
@@ -718,6 +781,7 @@ export class YouTubeSubtitleTranslator {
     this.progress.inflight = 0;
     this.progress.pending = cues.length;
     this.translations.clear();
+    this.pendingHint = "翻译中...";
     // 先开始按时间渲染，让用户立刻看到“翻译中...”，翻译在后台逐批完成。
     this.startSync();
     void this.translateAllCues(payload.videoId);
@@ -733,6 +797,7 @@ export class YouTubeSubtitleTranslator {
     this.progress.translated = 0;
     this.progress.inflight = 0;
     this.progress.pending = 0;
+    this.pendingHint = "翻译中...";
   }
 
   private getContext(index: number): { before: string[]; after: string[] } {
@@ -768,6 +833,13 @@ export class YouTubeSubtitleTranslator {
     return items;
   }
 
+  private mapSentencesToRanges(
+    sentences: string[],
+    originalCues: SubtitleCue[]
+  ): CueSentenceRange[] {
+    return mapSentencesToRangesOrFallback(sentences, originalCues);
+  }
+
   private async sendBatch(
     requestId: string,
     items: BatchTranslationItem[],
@@ -793,6 +865,163 @@ export class YouTubeSubtitleTranslator {
     });
 
     return promise;
+  }
+
+  private async sendResegment(requestId: string, texts: string[]): Promise<string[]> {
+    if (!this.port) {
+      throw new Error("翻译通道未建立。");
+    }
+    const promise = new Promise<string[]>((resolve, reject) => {
+      this.pendingResegments.set(requestId, { resolve, reject });
+    });
+
+    postResegment(this.port, {
+      requestId,
+      texts
+    });
+
+    return promise;
+  }
+
+  private getCurrentCueIndex(): number {
+    const video = document.querySelector<HTMLVideoElement>("video.html5-main-video");
+    if (!video) {
+      return 0;
+    }
+    const found = this.findCueByTime(video.currentTime);
+    return found ? found.index : 0;
+  }
+
+  private buildResegmentStageItems(
+    ranges: CueSentenceRange[],
+    absoluteStageStart: number
+  ): {
+    items: BatchTranslationItem[];
+    rangeByItemId: Map<string, { start: number; end: number }>;
+  } {
+    const items: BatchTranslationItem[] = [];
+    const rangeByItemId = new Map<string, { start: number; end: number }>();
+    for (let i = 0; i < ranges.length; i += 1) {
+      const range = ranges[i];
+      if (!range.text.trim()) {
+        continue;
+      }
+      const absoluteStart = absoluteStageStart + range.startIndex;
+      const absoluteEnd = absoluteStageStart + range.endIndex;
+      const context = this.getContext(absoluteStart);
+      const id = String(i);
+      items.push({
+        id,
+        text: range.text,
+        contextBefore: context.before,
+        contextAfter: context.after
+      });
+      rangeByItemId.set(id, {
+        start: absoluteStart,
+        end: absoluteEnd
+      });
+    }
+    return {
+      items,
+      rangeByItemId
+    };
+  }
+
+  private async translateAsrCuesByPlaybackStages(videoId: string): Promise<void> {
+    const total = this.cues.length;
+    if (total === 0) {
+      return;
+    }
+
+    const currentIndex = this.getCurrentCueIndex();
+    const stages = buildStageWindowsByPlayback(total, RESEGMENT_BATCH_SIZE, currentIndex);
+    console.log(
+      LOG_PREFIX,
+      "[phase:asr_stage_pipeline]",
+      "currentIndex:",
+      currentIndex,
+      "stages:",
+      stages.length
+    );
+
+    for (const stage of stages) {
+      if (!this.enabled || this.currentVideoId !== videoId) {
+        return;
+      }
+
+      const cueCount = stage.end - stage.start;
+      if (cueCount <= 0) {
+        continue;
+      }
+
+      const chunk = this.cues.slice(stage.start, stage.end);
+      const texts = chunk
+        .map((cue) => cue.text.replace(/\s+/g, " ").trim())
+        .filter(Boolean);
+
+      let ranges: CueSentenceRange[];
+      if (texts.length === 0) {
+        ranges = this.mapSentencesToRanges([], chunk);
+      } else {
+        const requestId = createRequestId("yt-resegment");
+        try {
+          const sentences = await this.sendResegment(requestId, texts);
+          ranges = this.mapSentencesToRanges(sentences, chunk);
+        } catch (error) {
+          console.warn(
+            LOG_PREFIX,
+            "Resegment stage failed, fallback to raw chunk:",
+            error instanceof Error ? error.message : String(error)
+          );
+          ranges = this.mapSentencesToRanges([], chunk);
+        }
+      }
+
+      const { items, rangeByItemId } = this.buildResegmentStageItems(ranges, stage.start);
+      if (items.length === 0) {
+        continue;
+      }
+
+      this.progress.inflight += cueCount;
+      this.progress.pending = Math.max(0, total - this.progress.translated - this.progress.inflight);
+
+      try {
+        for (let start = 0; start < items.length; start += DEFAULT_SUBTITLE_BATCH_SIZE) {
+          if (!this.enabled || this.currentVideoId !== videoId) {
+            return;
+          }
+
+          const end = Math.min(items.length, start + DEFAULT_SUBTITLE_BATCH_SIZE);
+          const batchItems = items.slice(start, end);
+          const requestId = createRequestId("yt-batch");
+          const translated = await this.sendBatch(requestId, batchItems, videoId);
+
+          for (const item of batchItems) {
+            const value = translated[item.id] ?? item.text;
+            const mapped = rangeByItemId.get(item.id);
+            if (!mapped) {
+              continue;
+            }
+            for (let index = mapped.start; index <= mapped.end; index += 1) {
+              if (!this.translations.has(index)) {
+                this.progress.translated += 1;
+              }
+              this.translations.set(index, value);
+            }
+          }
+        }
+      } catch (error) {
+        this.lastError = error instanceof Error ? error.message : "字幕翻译失败。";
+        console.error(LOG_PREFIX, "translateAsrCuesByPlaybackStages failed:", this.lastError);
+        break;
+      } finally {
+        this.progress.inflight = Math.max(0, this.progress.inflight - cueCount);
+        this.progress.pending = Math.max(
+          0,
+          total - this.progress.translated - this.progress.inflight
+        );
+      }
+    }
   }
 
   private async translateAllCues(videoId: string): Promise<void> {
@@ -896,48 +1125,54 @@ export class YouTubeSubtitleTranslator {
 
     const translated =
       this.translations.get(found.index) ??
-      (this.lastError ? `翻译失败：${this.lastError}` : "翻译中...");
+      (this.lastError ? `翻译失败：${this.lastError}` : this.pendingHint);
     this.renderer.setTranslation(translated);
   }
 }
 
-const translator = new YouTubeSubtitleTranslator();
-void translator.initialize();
-const toggleButton = new YouTubeSubtitleToggleButton(translator);
-toggleButton.start();
+function bootstrapYouTubeTranslator(): void {
+  const translator = new YouTubeSubtitleTranslator();
+  void translator.initialize();
+  const toggleButton = new YouTubeSubtitleToggleButton(translator);
+  toggleButton.start();
 
-chrome.runtime.onMessage.addListener(
-  (
-    message: RuntimeRequestMessage,
-    _sender,
-    sendResponse: (response: RuntimeResponseMessage) => void
-  ) => {
-    if (!message || typeof message !== "object") {
-      return;
-    }
-    if (message.type === "page:get-status") {
-      sendResponse({
-        ok: true,
-        status: translator.getStatus()
-      });
-      return;
-    }
-    if (message.type === "page:toggle") {
-      void (async () => {
-        await setSitePreference(toSiteKey(window.location.href), message.payload.enabled);
-        await translator.setEnabled(message.payload.enabled);
-        toggleButton.sync();
+  chrome.runtime.onMessage.addListener(
+    (
+      message: RuntimeRequestMessage,
+      _sender,
+      sendResponse: (response: RuntimeResponseMessage) => void
+    ) => {
+      if (!message || typeof message !== "object") {
+        return;
+      }
+      if (message.type === "page:get-status") {
         sendResponse({
           ok: true,
           status: translator.getStatus()
         });
-      })();
-      return true;
+        return;
+      }
+      if (message.type === "page:toggle") {
+        void (async () => {
+          await setSitePreference(toSiteKey(window.location.href), message.payload.enabled);
+          await translator.setEnabled(message.payload.enabled);
+          toggleButton.sync();
+          sendResponse({
+            ok: true,
+            status: translator.getStatus()
+          });
+        })();
+        return true;
+      }
     }
-  }
-);
+  );
 
-window.addEventListener("beforeunload", () => {
-  toggleButton.stop();
-  translator.dispose();
-});
+  window.addEventListener("beforeunload", () => {
+    toggleButton.stop();
+    translator.dispose();
+  });
+}
+
+if (typeof chrome !== "undefined" && typeof window !== "undefined" && chrome.runtime?.onMessage) {
+  bootstrapYouTubeTranslator();
+}
