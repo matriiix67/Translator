@@ -21,7 +21,7 @@ interface InflightRequest {
   mount: TranslationMount;
 }
 
-const TRANSLATABLE_SELECTOR = [
+const BLOCK_TRANSLATABLE_SELECTOR = [
   "p",
   "h1",
   "h2",
@@ -33,9 +33,10 @@ const TRANSLATABLE_SELECTOR = [
   "td",
   "th",
   "blockquote",
-  "figcaption",
-  "span"
+  "figcaption"
 ].join(",");
+
+const TRANSLATABLE_SELECTOR = `${BLOCK_TRANSLATABLE_SELECTOR},span`;
 
 const EXCLUDED_SELECTOR = [
   "script",
@@ -73,7 +74,7 @@ function isElementVisible(element: HTMLElement): boolean {
   return true;
 }
 
-function collectCandidates(root: ParentNode): HTMLElement[] {
+export function collectCandidates(root: ParentNode): HTMLElement[] {
   if (!("querySelectorAll" in root)) {
     return [];
   }
@@ -91,6 +92,13 @@ function collectCandidates(root: ParentNode): HTMLElement[] {
     if (element.closest(EXCLUDED_SELECTOR)) {
       return false;
     }
+    // 避免同一段文本被“块元素 + 内联 span”同时命中导致双重翻译。
+    if (
+      element.tagName === "SPAN" &&
+      Boolean(element.closest(BLOCK_TRANSLATABLE_SELECTOR))
+    ) {
+      return false;
+    }
     if (!isElementVisible(element)) {
       return false;
     }
@@ -101,10 +109,8 @@ function collectCandidates(root: ParentNode): HTMLElement[] {
     if (!isLikelyEnglish(text)) {
       return false;
     }
-    const nestedBlocks = element.querySelector(
-      "p, h1, h2, h3, h4, h5, h6, li, blockquote, td, th"
-    );
-    if (nestedBlocks && nestedBlocks !== element.firstElementChild) {
+    const nestedBlocks = element.querySelector(BLOCK_TRANSLATABLE_SELECTOR);
+    if (nestedBlocks) {
       return false;
     }
     return true;
