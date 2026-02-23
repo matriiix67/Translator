@@ -1,0 +1,117 @@
+body {
+  margin: 0;
+  padding: 0;
+  background: #f7f8ff;
+  color: #0f172a;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+#app {
+  max-width: 900px;
+  margin: 0 auto;
+  padding: 24px;
+}
+
+.header h1 {
+  margin: 0;
+  font-size: 28px;
+}
+
+.header p {
+  margin: 8px 0 18px;
+  color: #475569;
+}
+
+.layout {
+  display: grid;
+  gap: 14px;
+}
+
+.card {
+  background: #ffffff;
+  border: 1px solid #dbe2ff;
+  border-radius: 12px;
+  padding: 16px 18px;
+}
+
+.card h2 {
+  margin: 0 0 14px;
+  font-size: 18px;
+}
+
+.field {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+}
+
+.field.inline {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.field span {
+  font-size: 13px;
+  color: #334155;
+}
+
+input,
+select {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid #ccd6ff;
+  border-radius: 8px;
+  padding: 10px;
+  font-size: 14px;
+  background: #fcfdff;
+}
+
+input[type="color"] {
+  height: 42px;
+  padding: 4px;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(220px, 1fr));
+  gap: 10px;
+}
+
+.actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+button {
+  border: 0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.primary {
+  background: #4f46e5;
+  color: #ffffff;
+}
+
+.primary:hover {
+  background: #4338ca;
+}
+
+.secondary {
+  background: #eef1ff;
+  color: #1e3a8a;
+}
+
+.secondary:hover {
+  background: #e4e8ff;
+}
+
+.status {
+  font-size: 13px;
+  color: #334155;
+}

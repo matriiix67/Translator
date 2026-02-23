@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Translator 设置</title>
+    <link rel="stylesheet" href="./options.css" />
+  </head>
+  <body>
+    <div id="app">
+      <header class="header">
+        <h1>AI Translator 设置</h1>
+        <p>配置 OpenAI / Gemini / MiniMax / Kimi 接口并调整翻译行为</p>
+      </header>
+
+      <form id="config-form" class="layout">
+        <section class="card">
+          <h2>模型接入</h2>
+          <label class="field">
+            <span>服务商</span>
+            <select id="provider">
+              <option value="openai">OpenAI</option>
+              <option value="gemini">Google Gemini</option>
+              <option value="minimax">MiniMax</option>
+              <option value="kimi">Kimi (Moonshot)</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>API Key</span>
+            <input id="apiKey" type="password" placeholder="sk-..." autocomplete="off" />
+          </label>
+          <label class="field">
+            <span>API 端点</span>
+            <input id="baseURL" type="text" placeholder="https://api.openai.com/v1" />
+          </label>
+          <label class="field">
+            <span>模型名称</span>
+            <input id="model" type="text" placeholder="gpt-4o-mini" />
+          </label>
+          <button id="test-connection" type="button" class="secondary">
+            测试连接
+          </button>
+        </section>
+
+        <section class="card">
+          <h2>翻译行为</h2>
+          <label class="field">
+            <span>目标语言</span>
+            <select id="targetLang">
+              <option value="zh-CN">简体中文</option>
+              <option value="zh-TW">繁體中文</option>
+              <option value="ja-JP">日语</option>
+              <option value="ko-KR">韩语</option>
+              <option value="fr-FR">法语</option>
+              <option value="de-DE">德语</option>
+            </select>
+          </label>
+          <label class="field">
+            <span>网页上下文窗口（段落数）</span>
+            <input id="contextWindow" type="number" min="1" max="8" />
+          </label>
+          <label class="field">
+            <span>YouTube 上下文窗口（字幕条数）</span>
+            <input id="subtitleContextWindow" type="number" min="2" max="20" />
+          </label>
+          <label class="field inline">
+            <input id="autoTranslate" type="checkbox" />
+            <span>默认自动翻译当前网站</span>
+          </label>
+        </section>
+
+        <section class="card">
+          <h2>译文样式</h2>
+          <div class="grid">
+            <label class="field">
+              <span>字号</span>
+              <input id="fontSize" type="text" placeholder="0.92em" />
+            </label>
+            <label class="field">
+              <span>文字颜色</span>
+              <input id="fontColor" type="color" />
+            </label>
+            <label class="field">
+              <span>背景颜色</span>
+              <input id="backgroundColor" type="color" />
+            </label>
+            <label class="field">
+              <span>边线颜色</span>
+              <input id="borderColor" type="color" />
+            </label>
+          </div>
+        </section>
+
+        <div class="actions">
+          <button type="submit" class="primary">保存设置</button>
+          <span id="status-text" class="status">读取配置中...</span>
+        </div>
+      </form>
+    </div>
+    <script src="./options.js"></script>
+  </body>
+</html>

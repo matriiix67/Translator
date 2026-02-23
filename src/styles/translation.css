@@ -1,0 +1,10 @@
+.ai-translator-host {
+  all: initial;
+  display: block;
+  width: 100%;
+  contain: content;
+}
+
+.ai-translator-yt-subtitles {
+  font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
