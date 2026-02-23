@@ -461,45 +461,70 @@ export class YouTubeSubtitleTranslator {
 
     console.log(LOG_PREFIX, "Discovering tracks for:", videoId);
 
-    let result = await this.requestTracksFromMainWorld(videoId);
-    if (result) {
-      console.log(
-        LOG_PREFIX,
-        "Main-world track result:",
-        result.source,
-        "tracks:",
-        result.tracks.length,
-        "videoId:",
-        result.videoId
+    const maxAttempts = 4;
+    let result: TrackDiscoveryResult = {
+      videoId,
+      tracks: [],
+      source: "none"
+    };
+    const isUsableResult = (candidate: TrackDiscoveryResult | null): candidate is TrackDiscoveryResult =>
+      Boolean(
+        candidate &&
+          candidate.tracks.length > 0 &&
+          (!candidate.videoId || candidate.videoId === videoId)
       );
-    }
 
-    if (!result || result.tracks.length === 0) {
-      result = extractTracksFromDOM();
-      console.log(
-        LOG_PREFIX,
-        "DOM extraction:",
-        result.source,
-        "tracks:",
-        result.tracks.length,
-        "videoId:",
-        result.videoId
-      );
-    }
+    for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+      const fromMainWorld = await this.requestTracksFromMainWorld(videoId);
+      if (fromMainWorld) {
+        console.log(
+          LOG_PREFIX,
+          `[tracks] attempt ${attempt}/${maxAttempts} main-world:`,
+          fromMainWorld.source,
+          "tracks:",
+          fromMainWorld.tracks.length,
+          "videoId:",
+          fromMainWorld.videoId
+        );
+      }
+      if (isUsableResult(fromMainWorld)) {
+        result = fromMainWorld;
+        break;
+      }
 
-    if (
-      result.tracks.length === 0 ||
-      (result.videoId && result.videoId !== videoId)
-    ) {
-      console.log(LOG_PREFIX, "DOM miss or stale, fetching page HTML...");
-      result = await fetchTracksForVideoId(videoId);
+      const fromDom = extractTracksFromDOM();
       console.log(
         LOG_PREFIX,
-        "Fetch result:",
-        result.source,
+        `[tracks] attempt ${attempt}/${maxAttempts} dom:`,
+        fromDom.source,
         "tracks:",
-        result.tracks.length
+        fromDom.tracks.length,
+        "videoId:",
+        fromDom.videoId
       );
+      if (isUsableResult(fromDom)) {
+        result = fromDom;
+        break;
+      }
+
+      if (attempt === maxAttempts) {
+        console.log(LOG_PREFIX, "DOM/main-world miss, fetching page HTML...");
+        const fromFetch = await fetchTracksForVideoId(videoId);
+        console.log(
+          LOG_PREFIX,
+          `[tracks] attempt ${attempt}/${maxAttempts} fetch:`,
+          fromFetch.source,
+          "tracks:",
+          fromFetch.tracks.length,
+          "videoId:",
+          fromFetch.videoId
+        );
+        if (isUsableResult(fromFetch)) {
+          result = fromFetch;
+        }
+      } else {
+        await new Promise((resolve) => window.setTimeout(resolve, 220 * attempt));
+      }
     }
 
     if (result.tracks.length === 0) {
@@ -507,6 +532,15 @@ export class YouTubeSubtitleTranslator {
       this.lastError = "当前视频没有可用字幕轨道。";
       return;
     }
+
+    console.log(
+      LOG_PREFIX,
+      "[phase:tracks_ok]",
+      "source:",
+      result.source,
+      "tracks:",
+      result.tracks.length
+    );
 
     await this.handleTrackPayload({
       videoId: result.videoId ?? videoId,
@@ -675,6 +709,7 @@ export class YouTubeSubtitleTranslator {
       return;
     }
 
+    console.log(LOG_PREFIX, "[phase:cues_ok]", "count:", cues.length);
     console.log(LOG_PREFIX, "Fetched", cues.length, "cues, starting translation...");
     this.cues.splice(0, this.cues.length, ...cues);
     this.lastError = undefined;
@@ -808,6 +843,12 @@ export class YouTubeSubtitleTranslator {
 
   private startSync(): void {
     this.stopSync();
+    console.log(
+      LOG_PREFIX,
+      "[phase:sync_started]",
+      "cues:",
+      this.cues.length
+    );
     this.syncTimer = window.setInterval(() => this.syncSubtitleByTime(), 140);
   }
 

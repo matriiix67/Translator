@@ -31,6 +31,7 @@ interface YouTubePlayerLike {
 }
 
 interface InterceptedSubtitle {
+  videoId: string;
   text: string;
   fmt: string;
   languageCode: string;
@@ -84,10 +85,11 @@ declare global {
 }
 
 const interceptedSubtitles = new Map<string, InterceptedSubtitle>();
-const pendingByLang = new Map<
+const pendingByVideoLang = new Map<
   string,
   Array<(subtitle: InterceptedSubtitle | null) => void>
 >();
+let lastKnownVideoId = (getCurrentVideoId() ?? "").trim();
 
 function normalizeLanguageCode(languageCode?: string): string {
   return (languageCode ?? "").trim().toLowerCase();
@@ -99,6 +101,14 @@ function normalizeKind(kind?: string): string {
 
 function subtitleKey(languageCode: string, kind?: string): string {
   return `${normalizeLanguageCode(languageCode)}:${normalizeKind(kind)}`;
+}
+
+function videoSubtitleKey(videoId: string, languageCode: string, kind?: string): string {
+  return `${videoId}:${subtitleKey(languageCode, kind)}`;
+}
+
+function pendingVideoLangKey(videoId: string, languageCode: string): string {
+  return `${videoId}:${normalizeLanguageCode(languageCode)}`;
 }
 
 function extractTrackName(track: PlayerTrackLike): string | undefined {
@@ -208,6 +218,7 @@ function getAvailableTracks(): YouTubeCaptionTrack[] {
 }
 
 function parseTimedtextMeta(rawUrl: string): {
+  videoId: string;
   languageCode: string;
   kind?: string;
   fmt: string;
@@ -221,24 +232,58 @@ function parseTimedtextMeta(rawUrl: string): {
     if (!languageCode) {
       return null;
     }
+    const videoId = (
+      url.searchParams.get("v") ??
+      url.searchParams.get("docid") ??
+      getCurrentVideoId() ??
+      ""
+    ).trim();
+    if (!videoId) {
+      return null;
+    }
     const kind = url.searchParams.get("kind") ?? undefined;
     const fmt = url.searchParams.get("fmt") ?? "xml";
-    return { languageCode, kind, fmt };
+    return { videoId, languageCode, kind, fmt };
   } catch {
     return null;
   }
 }
 
-function resolvePending(languageCode: string): void {
-  const key = normalizeLanguageCode(languageCode);
-  const resolvers = pendingByLang.get(key);
+function clearSubtitleCaches(reason: string): void {
+  if (interceptedSubtitles.size > 0 || pendingByVideoLang.size > 0) {
+    console.log("[AI Translator][bridge] clear subtitle caches:", reason);
+  }
+  interceptedSubtitles.clear();
+  for (const resolvers of pendingByVideoLang.values()) {
+    for (const resolve of resolvers) {
+      resolve(null);
+    }
+  }
+  pendingByVideoLang.clear();
+}
+
+function syncVideoContext(): string | null {
+  const currentVideoId = (getCurrentVideoId() ?? "").trim();
+  if (!currentVideoId) {
+    return null;
+  }
+  if (lastKnownVideoId && currentVideoId !== lastKnownVideoId) {
+    clearSubtitleCaches(`video changed: ${lastKnownVideoId} -> ${currentVideoId}`);
+  }
+  lastKnownVideoId = currentVideoId;
+  return currentVideoId;
+}
+
+function resolvePending(videoId: string, languageCode: string): void {
+  const key = pendingVideoLangKey(videoId, languageCode);
+  const resolvers = pendingByVideoLang.get(key);
   if (!resolvers || resolvers.length === 0) {
     return;
   }
-  pendingByLang.delete(key);
+  pendingByVideoLang.delete(key);
   const subtitle =
-    interceptedSubtitles.get(`${key}:asr`) ??
-    interceptedSubtitles.get(`${key}:`) ??
+    interceptedSubtitles.get(videoSubtitleKey(videoId, languageCode, "asr")) ??
+    interceptedSubtitles.get(videoSubtitleKey(videoId, languageCode)) ??
     null;
   for (const resolve of resolvers) {
     resolve(subtitle);
@@ -254,15 +299,23 @@ function storeInterceptedSubtitle(rawUrl: string, text: string): void {
   if (!meta) {
     return;
   }
+  const currentVideoId = syncVideoContext();
+  if (currentVideoId && meta.videoId !== currentVideoId) {
+    return;
+  }
   const payload: InterceptedSubtitle = {
+    videoId: meta.videoId,
     text: trimmed,
     fmt: meta.fmt,
     languageCode: meta.languageCode,
     kind: meta.kind
   };
-  interceptedSubtitles.set(subtitleKey(meta.languageCode, meta.kind), payload);
-  interceptedSubtitles.set(subtitleKey(meta.languageCode), payload);
-  resolvePending(meta.languageCode);
+  interceptedSubtitles.set(
+    videoSubtitleKey(meta.videoId, meta.languageCode, meta.kind),
+    payload
+  );
+  interceptedSubtitles.set(videoSubtitleKey(meta.videoId, meta.languageCode), payload);
+  resolvePending(meta.videoId, meta.languageCode);
 }
 
 function installNetworkInterceptors(): void {
@@ -352,6 +405,33 @@ async function waitForTracklist(player: YouTubePlayerLike): Promise<PlayerTrackL
   return [];
 }
 
+async function getAvailableTracksWithRetry(maxAttempts = 4): Promise<YouTubeCaptionTrack[]> {
+  const player = getMoviePlayer();
+  if (player) {
+    try {
+      player.loadModule?.("captions");
+    } catch {
+      // ignore
+    }
+  }
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+    const tracks = getAvailableTracks();
+    if (tracks.length > 0) {
+      return tracks;
+    }
+
+    if (player) {
+      await waitForTracklist(player);
+    }
+
+    if (attempt < maxAttempts) {
+      await wait(220 * attempt);
+    }
+  }
+  return getAvailableTracks();
+}
+
 function pickTrackForLanguage(
   tracks: PlayerTrackLike[],
   languageCode: string,
@@ -408,49 +488,52 @@ async function triggerCaptionLoad(languageCode: string, kind?: string): Promise<
 }
 
 function getInterceptedSubtitle(
+  videoId: string,
   languageCode: string,
   kind?: string
 ): InterceptedSubtitle | null {
   return (
-    interceptedSubtitles.get(subtitleKey(languageCode, kind)) ??
-    interceptedSubtitles.get(subtitleKey(languageCode)) ??
+    interceptedSubtitles.get(videoSubtitleKey(videoId, languageCode, kind)) ??
+    interceptedSubtitles.get(videoSubtitleKey(videoId, languageCode)) ??
+    interceptedSubtitles.get(videoSubtitleKey(videoId, languageCode, "asr")) ??
     null
   );
 }
 
 function waitForInterceptedSubtitle(
+  videoId: string,
   languageCode: string,
   kind?: string,
   timeoutMs = 12000
 ): Promise<InterceptedSubtitle | null> {
-  const existing = getInterceptedSubtitle(languageCode, kind);
+  const existing = getInterceptedSubtitle(videoId, languageCode, kind);
   if (existing) {
     return Promise.resolve(existing);
   }
-  const key = normalizeLanguageCode(languageCode);
+  const key = pendingVideoLangKey(videoId, languageCode);
   return new Promise((resolve) => {
     const timeoutId = window.setTimeout(() => {
-      const list = pendingByLang.get(key) ?? [];
+      const list = pendingByVideoLang.get(key) ?? [];
       const index = list.indexOf(resolver);
       if (index >= 0) {
         list.splice(index, 1);
       }
       if (list.length > 0) {
-        pendingByLang.set(key, list);
+        pendingByVideoLang.set(key, list);
       } else {
-        pendingByLang.delete(key);
+        pendingByVideoLang.delete(key);
       }
-      resolve(getInterceptedSubtitle(languageCode, kind));
+      resolve(getInterceptedSubtitle(videoId, languageCode, kind));
     }, timeoutMs);
 
     const resolver = (_subtitle: InterceptedSubtitle | null): void => {
       window.clearTimeout(timeoutId);
-      resolve(getInterceptedSubtitle(languageCode, kind));
+      resolve(getInterceptedSubtitle(videoId, languageCode, kind));
     };
 
-    const resolvers = pendingByLang.get(key) ?? [];
+    const resolvers = pendingByVideoLang.get(key) ?? [];
     resolvers.push(resolver);
-    pendingByLang.set(key, resolvers);
+    pendingByVideoLang.set(key, resolvers);
   });
 }
 
@@ -493,7 +576,8 @@ function postSubtitleResult(
 }
 
 async function handleTracksRequest(request: BridgeRequestTracksMessage): Promise<void> {
-  const tracks = getAvailableTracks();
+  syncVideoContext();
+  const tracks = await getAvailableTracksWithRetry(4);
   postTracksResult(request.requestId, {
     videoId: getCurrentVideoId(),
     tracks
@@ -503,6 +587,7 @@ async function handleTracksRequest(request: BridgeRequestTracksMessage): Promise
 async function handleSubtitleRequest(
   request: BridgeRequestSubtitleMessage
 ): Promise<void> {
+  const currentVideoId = syncVideoContext();
   const languageCode = request.payload?.languageCode?.trim();
   const kind = request.payload?.kind;
   if (!languageCode) {
@@ -519,11 +604,25 @@ async function handleSubtitleRequest(
     );
     return;
   }
+  if (!currentVideoId) {
+    postSubtitleResult(
+      request.requestId,
+      {
+        text: "",
+        fmt: "unknown",
+        languageCode,
+        kind
+      },
+      false,
+      "missing videoId"
+    );
+    return;
+  }
 
-  let subtitle = getInterceptedSubtitle(languageCode, kind);
+  let subtitle = getInterceptedSubtitle(currentVideoId, languageCode, kind);
   if (!subtitle) {
     await triggerCaptionLoad(languageCode, kind);
-    subtitle = await waitForInterceptedSubtitle(languageCode, kind);
+    subtitle = await waitForInterceptedSubtitle(currentVideoId, languageCode, kind);
   }
 
   if (!subtitle) {
@@ -573,3 +672,13 @@ function setupBridgeMessageListener(): void {
 
 installNetworkInterceptors();
 setupBridgeMessageListener();
+window.addEventListener(
+  "yt-navigate-finish",
+  () => {
+    syncVideoContext();
+  },
+  { passive: true }
+);
+window.addEventListener("beforeunload", () => {
+  clearSubtitleCaches("beforeunload");
+});

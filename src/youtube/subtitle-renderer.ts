@@ -11,6 +11,8 @@ export class SubtitleRenderer {
 
   private latestTranslation = "";
 
+  private lastNativeHiddenLogAt = 0;
+
   observeNativeCaptions(): void {
     if (this.observer) {
       return;
@@ -63,22 +65,16 @@ export class SubtitleRenderer {
 
   private syncToNativeCaptions(): void {
     const captionRoot = this.findNativeCaptionContainer();
-    if (!captionRoot) {
+    const playerHost = this.findPlayerContainer();
+    if (!playerHost) {
       this.detachTranslatedWrapper();
       this.nativeCaptionContainer = null;
       return;
     }
 
-    const captionHost = this.findCaptionHost(captionRoot);
-    if (!captionHost) {
+    if (this.nativeCaptionContainer !== playerHost) {
       this.detachTranslatedWrapper();
-      this.nativeCaptionContainer = null;
-      return;
-    }
-
-    if (this.nativeCaptionContainer !== captionHost) {
-      this.detachTranslatedWrapper();
-      this.nativeCaptionContainer = captionHost;
+      this.nativeCaptionContainer = playerHost;
     }
 
     this.ensureTranslatedNode();
@@ -86,45 +82,42 @@ export class SubtitleRenderer {
       return;
     }
 
-    const hasNativeCaption = this.hasVisibleNativeCaption(captionRoot);
+    const hasNativeCaption = captionRoot ? this.hasVisibleNativeCaption(captionRoot) : false;
     const hasTranslation = Boolean(this.latestTranslation);
     this.translatedLine.textContent = this.latestTranslation;
-    this.translatedWrapper.style.display =
-      hasNativeCaption && hasTranslation ? "flex" : "none";
+    if (!hasNativeCaption && hasTranslation) {
+      const now = Date.now();
+      if (now - this.lastNativeHiddenLogAt > 3000) {
+        this.lastNativeHiddenLogAt = now;
+        console.warn(
+          "[AI Translator][phase:render_blocked_by_native_caption]",
+          "native caption is not visible, fallback to show translated subtitle"
+        );
+      }
+    }
+    // Some videos use different caption segment visibility rules.
+    // Keep translated subtitle visible as long as we have text.
+    this.positionWrapper(playerHost, captionRoot, hasNativeCaption);
+    this.translatedWrapper.style.display = hasTranslation ? "flex" : "none";
+  }
+
+  private findPlayerContainer(): HTMLElement | null {
+    return document.querySelector<HTMLElement>(".html5-video-player");
   }
 
   private findNativeCaptionContainer(): HTMLElement | null {
-    return document.querySelector<HTMLElement>(
-      ".html5-video-player .ytp-caption-window-container"
-    );
-  }
-
-  private findCaptionHost(root: HTMLElement): HTMLElement | null {
-    const visibleSegments = Array.from(
-      root.querySelectorAll<HTMLElement>(".ytp-caption-segment")
-    ).filter((segment) => {
-      const text = segment.textContent?.trim() ?? "";
-      if (!text) {
-        return false;
-      }
-      const style = window.getComputedStyle(segment);
-      return style.display !== "none" && style.visibility !== "hidden";
-    });
-
-    if (visibleSegments.length > 0) {
-      const fromVisible = visibleSegments[0].closest<HTMLElement>(
-        ".ytp-caption-window-bottom, .ytp-caption-window-rollup, .caption-window, .ytp-caption-window"
-      );
-      if (fromVisible) {
-        return fromVisible;
+    const selectors = [
+      ".html5-video-player .ytp-caption-window-container",
+      ".html5-video-player .caption-window-container",
+      ".html5-video-player .captions-text"
+    ];
+    for (const selector of selectors) {
+      const found = document.querySelector<HTMLElement>(selector);
+      if (found) {
+        return found;
       }
     }
-
-    return (
-      root.querySelector<HTMLElement>(
-        ".ytp-caption-window-bottom, .ytp-caption-window-rollup, .caption-window, .ytp-caption-window"
-      ) ?? root
-    );
+    return null;
   }
 
   private hasVisibleNativeCaption(container: HTMLElement): boolean {
@@ -164,12 +157,20 @@ export class SubtitleRenderer {
     if (!wrapper.classList.contains("ai-translator-yt-translation-wrapper")) {
       wrapper.className = "ai-translator-yt-translation-wrapper";
     }
-    wrapper.style.width = "100%";
+    const hostStyle = window.getComputedStyle(this.nativeCaptionContainer);
+    if (hostStyle.position === "static") {
+      this.nativeCaptionContainer.style.position = "relative";
+    }
+    wrapper.style.width = "calc(100% - 24px)";
+    wrapper.style.maxWidth = "960px";
     wrapper.style.display = "none";
     wrapper.style.justifyContent = "center";
-    wrapper.style.marginTop = "4px";
+    wrapper.style.marginTop = "0";
     wrapper.style.pointerEvents = "none";
-    wrapper.style.position = "relative";
+    wrapper.style.position = "absolute";
+    wrapper.style.left = "50%";
+    wrapper.style.transform = "translateX(-50%)";
+    wrapper.style.bottom = "56px";
     wrapper.style.zIndex = "2147483000";
 
     let line =
@@ -207,6 +208,38 @@ export class SubtitleRenderer {
 
     this.translatedWrapper = wrapper;
     this.translatedLine = line;
+  }
+
+  private positionWrapper(
+    playerHost: HTMLElement,
+    captionRoot: HTMLElement | null,
+    hasNativeCaption: boolean
+  ): void {
+    if (!this.translatedWrapper) {
+      return;
+    }
+    let bottomPx = 56;
+    if (captionRoot && hasNativeCaption) {
+      const visibleSegments = Array.from(
+        captionRoot.querySelectorAll<HTMLElement>(".ytp-caption-segment")
+      ).filter((segment) => {
+        const text = segment.textContent?.trim() ?? "";
+        if (!text) {
+          return false;
+        }
+        const style = window.getComputedStyle(segment);
+        return style.display !== "none" && style.visibility !== "hidden";
+      });
+      if (visibleSegments.length > 0) {
+        const playerRect = playerHost.getBoundingClientRect();
+        const maxBottom = Math.max(
+          ...visibleSegments.map((segment) => segment.getBoundingClientRect().bottom)
+        );
+        const offsetFromBottom = Math.round(playerRect.bottom - maxBottom - 6);
+        bottomPx = Math.max(28, Math.min(180, offsetFromBottom));
+      }
+    }
+    this.translatedWrapper.style.bottom = `${bottomPx}px`;
   }
 
   private detachTranslatedWrapper(): void {
