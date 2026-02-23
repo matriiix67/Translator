@@ -15,17 +15,224 @@ import type {
   TranslationPortOutgoingMessage,
   YouTubeCaptionTrack
 } from "@shared/types";
-import { fetchSubtitleCues, selectPreferredTrack } from "@youtube/subtitle-fetcher";
+import {
+  parseCapturedSubtitlePayload,
+  extractTracksFromDOM,
+  fetchSubtitleCues,
+  fetchTracksForVideoId,
+  selectPreferredTrack,
+  type CapturedSubtitlePayload,
+  type TrackDiscoveryResult
+} from "@youtube/subtitle-fetcher";
 import { SubtitleRenderer } from "@youtube/subtitle-renderer";
 
-interface BridgeMessagePayload {
+const LOG_PREFIX = "[AI Translator]";
+
+interface BridgeTracksPayload {
   videoId?: string;
   tracks?: YouTubeCaptionTrack[];
+}
+
+interface BridgeSubtitlePayload extends CapturedSubtitlePayload {}
+
+type BridgeRequestType = "tracks:get" | "subtitle:get";
+type BridgeResultType = "tracks:result" | "subtitle:result";
+
+interface PendingBridgeRequest {
+  expectedType: BridgeResultType;
+  timeoutId: number;
+  resolve: (payload: unknown) => void;
+  reject: (error: Error) => void;
 }
 
 interface PendingBatch {
   resolve: (translations: Record<string, string>) => void;
   reject: (error: Error) => void;
+}
+
+class YouTubeSubtitleToggleButton {
+  private host: HTMLDivElement | null = null;
+
+  private button: HTMLButtonElement | null = null;
+
+  private observer: MutationObserver | null = null;
+
+  private mountedTo: HTMLElement | null = null;
+
+  private mountMode: "below" | "floating" | null = null;
+
+  private syncing = false;
+
+  constructor(private readonly translator: YouTubeSubtitleTranslator) {}
+
+  start(): void {
+    if (this.observer) {
+      return;
+    }
+    const root = document.body ?? document.documentElement;
+    if (!root) {
+      return;
+    }
+
+    this.observer = new MutationObserver(() => this.scheduleSync());
+    this.observer.observe(root, { childList: true, subtree: true });
+    window.addEventListener("yt-navigate-finish", this.onNavigateFinish, {
+      passive: true
+    });
+    this.scheduleSync();
+  }
+
+  stop(): void {
+    this.observer?.disconnect();
+    this.observer = null;
+    window.removeEventListener("yt-navigate-finish", this.onNavigateFinish);
+    this.host?.remove();
+    this.host = null;
+    this.button = null;
+    this.mountedTo = null;
+    this.mountMode = null;
+  }
+
+  sync(): void {
+    this.scheduleSync();
+  }
+
+  private readonly onNavigateFinish = () => {
+    this.scheduleSync();
+  };
+
+  private scheduleSync(): void {
+    if (this.syncing) {
+      return;
+    }
+    this.syncing = true;
+    window.requestAnimationFrame(() => {
+      this.syncing = false;
+      this.ensureMounted();
+      this.render();
+    });
+  }
+
+  private findMountPoint():
+    | { element: HTMLElement; mode: "below" | "floating" }
+    | null {
+    // 优先挂在播放器下方信息区域（用户可见且不会被视频层覆盖）
+    const belowCandidates = [
+      document.querySelector<HTMLElement>("#below"),
+      document.querySelector<HTMLElement>("#meta-contents"),
+      document.querySelector<HTMLElement>("#info-contents"),
+      document.querySelector<HTMLElement>("ytd-watch-metadata")
+    ];
+    for (const candidate of belowCandidates) {
+      if (candidate) {
+        return { element: candidate, mode: "below" };
+      }
+    }
+
+    // 回退：挂在播放器内部右下角，确保按钮至少可操作
+    const player = document.querySelector<HTMLElement>("#movie_player");
+    if (player) {
+      return { element: player, mode: "floating" };
+    }
+    return null;
+  }
+
+  private ensureMounted(): void {
+    const target = this.findMountPoint();
+    if (!target) {
+      return;
+    }
+    const mountPoint = target.element;
+    const mode = target.mode;
+
+    const existing =
+      this.host && this.host.isConnected ? this.host : null;
+    if (existing && this.mountedTo === mountPoint && this.mountMode === mode) {
+      return;
+    }
+
+    this.host?.remove();
+    const host = document.createElement("div");
+    host.className = "ai-translator-yt-toggle-host";
+    host.style.pointerEvents = "auto";
+
+    if (mode === "below") {
+      host.style.display = "flex";
+      host.style.justifyContent = "flex-end";
+      host.style.marginTop = "8px";
+      host.style.marginBottom = "8px";
+      host.style.paddingRight = "8px";
+      host.style.position = "relative";
+      host.style.zIndex = "10";
+    } else {
+      const computed = window.getComputedStyle(mountPoint);
+      if (computed.position === "static") {
+        mountPoint.style.position = "relative";
+      }
+      host.style.position = "absolute";
+      host.style.right = "12px";
+      host.style.bottom = "64px";
+      host.style.zIndex = "2147483600";
+    }
+
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ai-translator-yt-toggle-button";
+    button.style.display = "inline-flex";
+    button.style.alignItems = "center";
+    button.style.gap = "8px";
+    button.style.borderRadius = "999px";
+    button.style.border = "1px solid rgba(148, 163, 184, 0.7)";
+    button.style.background = "#374151";
+    button.style.color = "#ffffff";
+    button.style.padding = "8px 12px";
+    button.style.fontSize = "13px";
+    button.style.fontWeight = "600";
+    button.style.cursor = "pointer";
+    button.style.userSelect = "none";
+    button.style.boxShadow = "0 4px 14px rgba(0, 0, 0, 0.25)";
+
+    button.addEventListener("click", () => {
+      void this.toggle();
+    });
+
+    host.appendChild(button);
+
+    mountPoint.appendChild(host);
+    this.host = host;
+    this.button = button;
+    this.mountedTo = mountPoint;
+    this.mountMode = mode;
+  }
+
+  private async toggle(): Promise<void> {
+    const status = this.translator.getStatus();
+    const nextEnabled = !status.enabled;
+    await setSitePreference(toSiteKey(window.location.href), nextEnabled);
+    await this.translator.setEnabled(nextEnabled);
+    this.render();
+  }
+
+  private render(): void {
+    if (!this.button) {
+      return;
+    }
+    const status = this.translator.getStatus();
+    const enabled = status.enabled;
+    this.button.setAttribute("aria-pressed", enabled ? "true" : "false");
+
+    if (enabled) {
+      this.button.textContent = "字幕翻译：开";
+      this.button.style.background = "#4f46e5";
+      this.button.style.border = "1px solid #6366f1";
+      this.button.style.color = "#ffffff";
+    } else {
+      this.button.textContent = "字幕翻译：关";
+      this.button.style.background = "#374151";
+      this.button.style.border = "1px solid #4b5563";
+      this.button.style.color = "#ffffff";
+    }
+  }
 }
 
 export class YouTubeSubtitleTranslator {
@@ -44,6 +251,8 @@ export class YouTubeSubtitleTranslator {
   private readonly translations = new Map<number, string>();
 
   private readonly pendingBatches = new Map<string, PendingBatch>();
+
+  private readonly pendingBridgeRequests = new Map<string, PendingBridgeRequest>();
 
   private currentVideoId: string | undefined;
 
@@ -70,17 +279,30 @@ export class YouTubeSubtitleTranslator {
     this.contextWindow = Math.max(2, config.subtitleContextWindow);
     const sitePreference = await getSitePreference(this.siteKey);
     this.enabled = sitePreference ? sitePreference.enabled : config.autoTranslate;
+    console.log(LOG_PREFIX, "initialize: enabled =", this.enabled, "targetLang =", this.targetLang);
     this.connectPort();
-    this.injectBridgeScript();
+    // 轨道发现已改为 DOM/HTML 解析，不再依赖向页面注入脚本（YouTube CSP 可能导致注入失败或噪音错误）。
+    // 保留 bridge 监听以兼容旧逻辑/未来回退，但默认不注入 bridge。
     this.setupBridgeListener();
+
+    window.addEventListener(
+      "yt-navigate-finish",
+      () => void this.onNavigateFinish(),
+      { passive: true }
+    );
+
     if (!this.enabled) {
       this.renderer.hide();
+      return;
     }
+
+    await this.discoverTracks();
   }
 
   async setEnabled(enabled: boolean): Promise<void> {
     this.enabled = enabled;
     this.lastError = undefined;
+    console.log(LOG_PREFIX, "setEnabled:", enabled);
     if (!enabled) {
       this.stopSync();
       this.renderer.hide();
@@ -89,9 +311,8 @@ export class YouTubeSubtitleTranslator {
       return;
     }
     this.connectPort();
-    this.injectBridgeScript();
     this.loadedTrackKey = null;
-    window.dispatchEvent(new Event("yt-navigate-finish"));
+    await this.discoverTracks();
   }
 
   getStatus(): PageTranslationStatus {
@@ -110,6 +331,187 @@ export class YouTubeSubtitleTranslator {
     this.port?.disconnect();
     this.port = null;
     this.pendingBatches.clear();
+    for (const pending of this.pendingBridgeRequests.values()) {
+      window.clearTimeout(pending.timeoutId);
+    }
+    this.pendingBridgeRequests.clear();
+  }
+
+  private async onNavigateFinish(): Promise<void> {
+    console.log(LOG_PREFIX, "yt-navigate-finish detected");
+    if (!this.enabled) return;
+    await new Promise((r) => setTimeout(r, 600));
+    if (!this.enabled) return;
+    await this.discoverTracks();
+  }
+
+  private requestBridge<TPayload>(
+    type: BridgeRequestType,
+    expectedType: BridgeResultType,
+    payload?: Record<string, unknown>,
+    timeoutMs = 12000
+  ): Promise<TPayload> {
+    const requestId = createRequestId("yt-bridge");
+    return new Promise<TPayload>((resolve, reject) => {
+      const timeoutId = window.setTimeout(() => {
+        this.pendingBridgeRequests.delete(requestId);
+        reject(new Error(`bridge timeout: ${type}`));
+      }, timeoutMs);
+
+      this.pendingBridgeRequests.set(requestId, {
+        expectedType,
+        timeoutId,
+        resolve: (data) => resolve(data as TPayload),
+        reject
+      });
+
+      window.postMessage(
+        {
+          source: PAGE_BRIDGE_SOURCE,
+          type,
+          requestId,
+          ...(payload ? { payload } : {})
+        },
+        "*"
+      );
+    });
+  }
+
+  private async requestTracksFromMainWorld(
+    currentVideoId: string
+  ): Promise<TrackDiscoveryResult | null> {
+    try {
+      const payload = await this.requestBridge<BridgeTracksPayload>(
+        "tracks:get",
+        "tracks:result",
+        undefined,
+        9000
+      );
+      const tracks = Array.isArray(payload?.tracks)
+        ? payload.tracks.filter((track) => Boolean(track?.languageCode))
+        : [];
+      if (tracks.length === 0) {
+        return null;
+      }
+      return {
+        videoId: payload.videoId ?? currentVideoId,
+        tracks,
+        source: "main-world"
+      };
+    } catch (error) {
+      console.log(
+        LOG_PREFIX,
+        "Main-world track request failed:",
+        error instanceof Error ? error.message : String(error)
+      );
+      return null;
+    }
+  }
+
+  private async requestSubtitleCuesFromMainWorld(
+    track: YouTubeCaptionTrack
+  ): Promise<SubtitleCue[]> {
+    try {
+      const payload = await this.requestBridge<BridgeSubtitlePayload>(
+        "subtitle:get",
+        "subtitle:result",
+        {
+          languageCode: track.languageCode,
+          kind: track.kind
+        },
+        13000
+      );
+      if (!payload?.text?.trim()) {
+        return [];
+      }
+      const cues = parseCapturedSubtitlePayload(payload);
+      if (cues.length > 0) {
+        console.log(
+          LOG_PREFIX,
+          "Main-world subtitle payload parsed:",
+          cues.length,
+          "cues"
+        );
+      }
+      return cues;
+    } catch (error) {
+      console.log(
+        LOG_PREFIX,
+        "Main-world subtitle request failed:",
+        error instanceof Error ? error.message : String(error)
+      );
+      return [];
+    }
+  }
+
+  private async loadCuesForTrack(track: YouTubeCaptionTrack): Promise<SubtitleCue[]> {
+    const bridgeCues = await this.requestSubtitleCuesFromMainWorld(track);
+    if (bridgeCues.length > 0) {
+      return bridgeCues;
+    }
+    return fetchSubtitleCues(track);
+  }
+
+  private async discoverTracks(): Promise<void> {
+    const videoId = new URL(window.location.href).searchParams.get("v");
+    if (!videoId) {
+      console.log(LOG_PREFIX, "No video ID in URL, skipping");
+      return;
+    }
+
+    console.log(LOG_PREFIX, "Discovering tracks for:", videoId);
+
+    let result = await this.requestTracksFromMainWorld(videoId);
+    if (result) {
+      console.log(
+        LOG_PREFIX,
+        "Main-world track result:",
+        result.source,
+        "tracks:",
+        result.tracks.length,
+        "videoId:",
+        result.videoId
+      );
+    }
+
+    if (!result || result.tracks.length === 0) {
+      result = extractTracksFromDOM();
+      console.log(
+        LOG_PREFIX,
+        "DOM extraction:",
+        result.source,
+        "tracks:",
+        result.tracks.length,
+        "videoId:",
+        result.videoId
+      );
+    }
+
+    if (
+      result.tracks.length === 0 ||
+      (result.videoId && result.videoId !== videoId)
+    ) {
+      console.log(LOG_PREFIX, "DOM miss or stale, fetching page HTML...");
+      result = await fetchTracksForVideoId(videoId);
+      console.log(
+        LOG_PREFIX,
+        "Fetch result:",
+        result.source,
+        "tracks:",
+        result.tracks.length
+      );
+    }
+
+    if (result.tracks.length === 0) {
+      console.log(LOG_PREFIX, "No caption tracks found");
+      this.lastError = "当前视频没有可用字幕轨道。";
+      return;
+    }
+
+    await this.handleTrackPayload({
+      videoId: result.videoId ?? videoId,
+      tracks: result.tracks
+    });
   }
 
   private connectPort(): void {
@@ -132,6 +534,13 @@ export class YouTubeSubtitleTranslator {
 
   private handlePortMessage(message: TranslationPortOutgoingMessage): void {
     if (message.type === "translate:batchDone") {
+      console.log(
+        LOG_PREFIX,
+        "Batch done:",
+        message.payload.requestId,
+        "items:",
+        Object.keys(message.payload.translations).length
+      );
       const pending = this.pendingBatches.get(message.payload.requestId);
       if (!pending) {
         return;
@@ -142,6 +551,12 @@ export class YouTubeSubtitleTranslator {
     }
 
     if (message.type === "translate:error") {
+      console.error(
+        LOG_PREFIX,
+        "Batch translate error:",
+        message.payload.requestId,
+        message.payload.message
+      );
       const pending = this.pendingBatches.get(message.payload.requestId);
       if (!pending) {
         return;
@@ -159,32 +574,61 @@ export class YouTubeSubtitleTranslator {
       if (!event.data || typeof event.data !== "object") {
         return;
       }
-      if (event.data.source !== PAGE_BRIDGE_SOURCE || event.data.type !== "tracks") {
+      const data = event.data as {
+        source?: unknown;
+        type?: unknown;
+        requestId?: unknown;
+        ok?: unknown;
+        payload?: unknown;
+        error?: unknown;
+      };
+      if (data.source !== PAGE_BRIDGE_SOURCE) {
         return;
       }
-      const payload = event.data.payload as BridgeMessagePayload;
-      void this.handleTrackPayload(payload);
+
+      // 兼容旧版 page-bridge 的主动推送消息
+      if (data.type === "tracks" && data.payload && typeof data.payload === "object") {
+        void this.handleTrackPayload(data.payload as BridgeTracksPayload);
+        return;
+      }
+
+      const requestId = typeof data.requestId === "string" ? data.requestId : null;
+      if (!requestId) {
+        return;
+      }
+      const pending = this.pendingBridgeRequests.get(requestId);
+      if (!pending) {
+        return;
+      }
+      const responseType = typeof data.type === "string" ? data.type : "";
+      if (responseType !== pending.expectedType) {
+        return;
+      }
+
+      this.pendingBridgeRequests.delete(requestId);
+      window.clearTimeout(pending.timeoutId);
+      const ok = data.ok !== false;
+      if (!ok) {
+        pending.reject(
+          new Error(
+            typeof data.error === "string" ? data.error : "bridge request failed"
+          )
+        );
+        return;
+      }
+      pending.resolve(data.payload);
     });
   }
 
-  private injectBridgeScript(): void {
-    if (document.querySelector('script[data-ai-translator-yt-bridge="1"]')) {
-      return;
-    }
-    const script = document.createElement("script");
-    script.src = chrome.runtime.getURL("youtube/page-bridge.js");
-    script.dataset.aiTranslatorYtBridge = "1";
-    script.async = false;
-    (document.head || document.documentElement).appendChild(script);
-  }
-
-  private async handleTrackPayload(payload: BridgeMessagePayload): Promise<void> {
+  private async handleTrackPayload(payload: BridgeTracksPayload): Promise<void> {
     if (!this.enabled) {
+      console.log(LOG_PREFIX, "handleTrackPayload: skipped (disabled)");
       return;
     }
 
     const tracks = payload.tracks ?? [];
     if (!payload.videoId || tracks.length === 0) {
+      console.log(LOG_PREFIX, "handleTrackPayload: no videoId or tracks");
       return;
     }
 
@@ -195,29 +639,53 @@ export class YouTubeSubtitleTranslator {
     const preferredTrack = selectPreferredTrack(tracks);
     if (!preferredTrack) {
       this.lastError = "当前视频没有可用字幕轨道。";
+      console.log(LOG_PREFIX, "No preferred track found");
       return;
     }
 
+    console.log(
+      LOG_PREFIX,
+      "Selected track:", preferredTrack.languageCode,
+      preferredTrack.kind ?? "",
+      preferredTrack.name ?? ""
+    );
+
     const trackKey = `${payload.videoId}:${preferredTrack.languageCode}:${preferredTrack.baseUrl}`;
     if (trackKey === this.loadedTrackKey && this.cues.length > 0) {
+      console.log(LOG_PREFIX, "Track already loaded, skipping");
       return;
     }
     this.loadedTrackKey = trackKey;
 
-    const cues = await fetchSubtitleCues(preferredTrack);
+    // 先试首选轨道，如果失败就逐一尝试所有轨道
+    console.log(LOG_PREFIX, "Fetching subtitle cues...");
+    let cues = await this.loadCuesForTrack(preferredTrack);
+    if (!cues.length) {
+      console.log(LOG_PREFIX, "Preferred track returned 0 cues, trying all tracks...");
+      for (const fallbackTrack of tracks) {
+        if (fallbackTrack.baseUrl === preferredTrack.baseUrl) continue;
+        console.log(LOG_PREFIX, "Trying fallback track:", fallbackTrack.languageCode, fallbackTrack.kind ?? "");
+        cues = await this.loadCuesForTrack(fallbackTrack);
+        if (cues.length > 0) break;
+      }
+    }
     if (!cues.length) {
       this.lastError = "字幕获取失败或字幕为空。";
+      console.log(LOG_PREFIX, "No cues fetched from any track");
       return;
     }
 
+    console.log(LOG_PREFIX, "Fetched", cues.length, "cues, starting translation...");
     this.cues.splice(0, this.cues.length, ...cues);
+    this.lastError = undefined;
     this.progress.total = cues.length;
     this.progress.translated = 0;
     this.progress.inflight = 0;
     this.progress.pending = cues.length;
     this.translations.clear();
-    await this.translateAllCues(payload.videoId);
+    // 先开始按时间渲染，让用户立刻看到“翻译中...”，翻译在后台逐批完成。
     this.startSync();
+    void this.translateAllCues(payload.videoId);
   }
 
   private resetForVideo(videoId: string): void {
@@ -305,6 +773,15 @@ export class YouTubeSubtitleTranslator {
       const end = Math.min(total, start + DEFAULT_SUBTITLE_BATCH_SIZE);
       const items = this.buildBatchItems(start, end);
       const requestId = createRequestId("yt-batch");
+      console.log(
+        LOG_PREFIX,
+        "Translating batch:",
+        `${start}-${end - 1}`,
+        "size:",
+        items.length,
+        "requestId:",
+        requestId
+      );
       this.progress.inflight += items.length;
       this.progress.pending = Math.max(0, total - this.progress.translated - this.progress.inflight);
 
@@ -317,6 +794,7 @@ export class YouTubeSubtitleTranslator {
         }
       } catch (error) {
         this.lastError = error instanceof Error ? error.message : "字幕翻译失败。";
+        console.error(LOG_PREFIX, "translateAllCues failed:", this.lastError);
         break;
       } finally {
         this.progress.inflight = Math.max(0, this.progress.inflight - items.length);
@@ -375,13 +853,17 @@ export class YouTubeSubtitleTranslator {
       return;
     }
 
-    const translated = this.translations.get(found.index) ?? "翻译中...";
-    this.renderer.setLines(found.cue.text, translated);
+    const translated =
+      this.translations.get(found.index) ??
+      (this.lastError ? `翻译失败：${this.lastError}` : "翻译中...");
+    this.renderer.setTranslation(translated);
   }
 }
 
 const translator = new YouTubeSubtitleTranslator();
 void translator.initialize();
+const toggleButton = new YouTubeSubtitleToggleButton(translator);
+toggleButton.start();
 
 chrome.runtime.onMessage.addListener(
   (
@@ -403,6 +885,7 @@ chrome.runtime.onMessage.addListener(
       void (async () => {
         await setSitePreference(toSiteKey(window.location.href), message.payload.enabled);
         await translator.setEnabled(message.payload.enabled);
+        toggleButton.sync();
         sendResponse({
           ok: true,
           status: translator.getStatus()
@@ -414,5 +897,6 @@ chrome.runtime.onMessage.addListener(
 );
 
 window.addEventListener("beforeunload", () => {
+  toggleButton.stop();
   translator.dispose();
 });
