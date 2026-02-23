@@ -13,6 +13,20 @@ export class SubtitleRenderer {
 
   private lastNativeHiddenLogAt = 0;
 
+  private dragOffsetX = 0;
+
+  private dragOffsetY = 0;
+
+  private dragActive = false;
+
+  private dragStartX = 0;
+
+  private dragStartY = 0;
+
+  private dragOriginOffsetX = 0;
+
+  private dragOriginOffsetY = 0;
+
   observeNativeCaptions(): void {
     if (this.observer) {
       return;
@@ -45,6 +59,8 @@ export class SubtitleRenderer {
   }
 
   destroy(): void {
+    this.stopDrag();
+    this.unbindDragEvents();
     this.observer?.disconnect();
     this.observer = null;
     this.detachTranslatedWrapper();
@@ -85,6 +101,10 @@ export class SubtitleRenderer {
     const hasNativeCaption = captionRoot ? this.hasVisibleNativeCaption(captionRoot) : false;
     const hasTranslation = Boolean(this.latestTranslation);
     this.translatedLine.textContent = this.latestTranslation;
+    if (hasTranslation) {
+      // Ensure measurable box metrics before positioning.
+      this.translatedWrapper.style.display = "flex";
+    }
     if (!hasNativeCaption && hasTranslation) {
       const now = Date.now();
       if (now - this.lastNativeHiddenLogAt > 3000) {
@@ -166,11 +186,12 @@ export class SubtitleRenderer {
     wrapper.style.display = "none";
     wrapper.style.justifyContent = "center";
     wrapper.style.marginTop = "0";
-    wrapper.style.pointerEvents = "none";
+    wrapper.style.pointerEvents = "auto";
     wrapper.style.position = "absolute";
-    wrapper.style.left = "50%";
-    wrapper.style.transform = "translateX(-50%)";
-    wrapper.style.bottom = "56px";
+    wrapper.style.left = "12px";
+    wrapper.style.top = "56px";
+    wrapper.style.bottom = "auto";
+    wrapper.style.transform = "none";
     wrapper.style.zIndex = "2147483000";
 
     let line =
@@ -201,6 +222,9 @@ export class SubtitleRenderer {
     line.style.wordBreak = "break-word";
     line.style.textShadow = "0 1px 2px rgba(0, 0, 0, 0.85)";
     line.style.boxSizing = "border-box";
+    line.style.cursor = this.dragActive ? "grabbing" : "grab";
+    line.style.userSelect = "none";
+    line.onmousedown = (event: MouseEvent) => this.startDrag(event);
 
     if (!wrapper.isConnected) {
       this.nativeCaptionContainer.appendChild(wrapper);
@@ -218,7 +242,25 @@ export class SubtitleRenderer {
     if (!this.translatedWrapper) {
       return;
     }
-    let bottomPx = 56;
+    const playerRect = playerHost.getBoundingClientRect();
+    const measuredWrapperHeight = this.translatedWrapper.getBoundingClientRect().height;
+    const wrapperHeight = measuredWrapperHeight > 0 ? measuredWrapperHeight : 52;
+    const measuredWrapperWidth = this.translatedWrapper.getBoundingClientRect().width;
+    const wrapperWidth = measuredWrapperWidth > 0 ? measuredWrapperWidth : 420;
+    const minTop = 16;
+    const maxTop = Math.max(minTop, playerRect.height - wrapperHeight - 16);
+    const minLeft = 8;
+    const maxLeft = Math.max(minLeft, playerRect.width - wrapperWidth - 8);
+    const centeredLeft = (playerRect.width - wrapperWidth) / 2;
+    let topPx = maxTop - 44;
+
+    const controls = playerHost.querySelector<HTMLElement>(".ytp-chrome-bottom");
+    if (controls) {
+      const controlsRect = controls.getBoundingClientRect();
+      const controlsHeight = controlsRect.height > 0 ? controlsRect.height : 48;
+      topPx = playerRect.height - wrapperHeight - controlsHeight - 14;
+    }
+
     if (captionRoot && hasNativeCaption) {
       const visibleSegments = Array.from(
         captionRoot.querySelectorAll<HTMLElement>(".ytp-caption-segment")
@@ -231,16 +273,85 @@ export class SubtitleRenderer {
         return style.display !== "none" && style.visibility !== "hidden";
       });
       if (visibleSegments.length > 0) {
-        const playerRect = playerHost.getBoundingClientRect();
+        const minSegmentTop = Math.min(
+          ...visibleSegments.map((segment) => segment.getBoundingClientRect().top)
+        );
         const maxBottom = Math.max(
           ...visibleSegments.map((segment) => segment.getBoundingClientRect().bottom)
         );
-        const offsetFromBottom = Math.round(playerRect.bottom - maxBottom - 6);
-        bottomPx = Math.max(28, Math.min(180, offsetFromBottom));
+        const gap = 8;
+        const segmentTop = minSegmentTop - playerRect.top;
+        const segmentBottom = maxBottom - playerRect.top;
+        // Always place translated subtitle below native subtitle first.
+        topPx = segmentBottom + gap;
+        // If native subtitle is unusually high, keep translated subtitle from floating too high.
+        topPx = Math.max(topPx, segmentTop + 4);
       }
     }
-    this.translatedWrapper.style.bottom = `${bottomPx}px`;
+
+    const clampedTop = Math.max(minTop, Math.min(maxTop, topPx + this.dragOffsetY));
+    const clampedLeft = Math.max(
+      minLeft,
+      Math.min(maxLeft, centeredLeft + this.dragOffsetX)
+    );
+    this.dragOffsetX = clampedLeft - centeredLeft;
+    this.dragOffsetY = clampedTop - topPx;
+    this.translatedWrapper.style.left = `${Math.round(clampedLeft)}px`;
+    this.translatedWrapper.style.top = `${Math.round(clampedTop)}px`;
+    this.translatedWrapper.style.bottom = "auto";
   }
+
+  private startDrag(event: MouseEvent): void {
+    if (event.button !== 0) {
+      return;
+    }
+    event.preventDefault();
+    this.dragActive = true;
+    this.dragStartX = event.clientX;
+    this.dragStartY = event.clientY;
+    this.dragOriginOffsetX = this.dragOffsetX;
+    this.dragOriginOffsetY = this.dragOffsetY;
+    if (this.translatedLine) {
+      this.translatedLine.style.cursor = "grabbing";
+    }
+    this.bindDragEvents();
+  }
+
+  private bindDragEvents(): void {
+    window.addEventListener("mousemove", this.handleDragMove);
+    window.addEventListener("mouseup", this.handleDragEnd);
+  }
+
+  private unbindDragEvents(): void {
+    window.removeEventListener("mousemove", this.handleDragMove);
+    window.removeEventListener("mouseup", this.handleDragEnd);
+  }
+
+  private stopDrag(): void {
+    this.dragActive = false;
+    if (this.translatedLine) {
+      this.translatedLine.style.cursor = "grab";
+    }
+  }
+
+  private readonly handleDragMove = (event: MouseEvent): void => {
+    if (!this.dragActive) {
+      return;
+    }
+    const dx = event.clientX - this.dragStartX;
+    const dy = event.clientY - this.dragStartY;
+    this.dragOffsetX = this.dragOriginOffsetX + dx;
+    this.dragOffsetY = this.dragOriginOffsetY + dy;
+    this.scheduleSync();
+  };
+
+  private readonly handleDragEnd = (): void => {
+    if (!this.dragActive) {
+      return;
+    }
+    this.stopDrag();
+    this.unbindDragEvents();
+  };
 
   private detachTranslatedWrapper(): void {
     this.translatedWrapper?.remove();
