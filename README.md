@@ -28,3 +28,5 @@
 ## 示例
 
 <img width="742" height="1193" alt="image" src="https://github.com/user-attachments/assets/221348db-306d-4dab-8a74-c04eaf7b33eb" />
+
+<img width="1615" height="1019" alt="image" src="https://github.com/user-attachments/assets/8d36be6e-a7db-4959-bc13-74f8f9a615c0" />
