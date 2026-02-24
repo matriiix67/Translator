@@ -24,3 +24,7 @@
 - 多模型服务商：OpenAI / Gemini / MiniMax / Kimi（支持自定义端点与模型）
 - 上下文翻译：网页段落与字幕都携带前后文窗口
 - 设置页：模型配置、翻译偏好、样式与连接测试
+
+## 示例
+
+<img width="742" height="1193" alt="image" src="https://github.com/user-attachments/assets/221348db-306d-4dab-8a74-c04eaf7b33eb" />
