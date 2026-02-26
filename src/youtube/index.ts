@@ -265,6 +265,8 @@ export class YouTubeSubtitleTranslator {
 
   private readonly translations = new Map<number, string>();
 
+  private readonly sourceTexts = new Map<number, string>();
+
   private readonly pendingBatches = new Map<string, PendingBatch>();
 
   private readonly pendingResegments = new Map<string, PendingResegment>();
@@ -754,6 +756,14 @@ export class YouTubeSubtitleTranslator {
     }
 
     const shouldResegment = preferredTrack.kind === "asr" && cues.length >= 5;
+    console.log(
+      LOG_PREFIX,
+      "[phase:track_decision]",
+      "kind:", preferredTrack.kind,
+      "isAsr:", preferredTrack.kind === "asr",
+      "cueCount:", cues.length,
+      "shouldResegment:", shouldResegment
+    );
     if (shouldResegment) {
       console.log(
         LOG_PREFIX,
@@ -761,6 +771,7 @@ export class YouTubeSubtitleTranslator {
       );
       this.cues.splice(0, this.cues.length, ...cues);
       this.translations.clear();
+      this.sourceTexts.clear();
       this.lastError = undefined;
       this.progress.total = cues.length;
       this.progress.translated = 0;
@@ -781,6 +792,7 @@ export class YouTubeSubtitleTranslator {
     this.progress.inflight = 0;
     this.progress.pending = cues.length;
     this.translations.clear();
+    this.sourceTexts.clear();
     this.pendingHint = "翻译中...";
     // 先开始按时间渲染，让用户立刻看到“翻译中...”，翻译在后台逐批完成。
     this.startSync();
@@ -793,6 +805,7 @@ export class YouTubeSubtitleTranslator {
     this.stopSync();
     this.cues.length = 0;
     this.translations.clear();
+    this.sourceTexts.clear();
     this.progress.total = 0;
     this.progress.translated = 0;
     this.progress.inflight = 0;
@@ -1007,6 +1020,7 @@ export class YouTubeSubtitleTranslator {
                 this.progress.translated += 1;
               }
               this.translations.set(index, value);
+              this.sourceTexts.set(index, item.text);
             }
           }
         }
@@ -1126,7 +1140,8 @@ export class YouTubeSubtitleTranslator {
     const translated =
       this.translations.get(found.index) ??
       (this.lastError ? `翻译失败：${this.lastError}` : this.pendingHint);
-    this.renderer.setTranslation(translated);
+    const source = this.sourceTexts.get(found.index);
+    this.renderer.setTranslation(translated, source);
   }
 }
 
