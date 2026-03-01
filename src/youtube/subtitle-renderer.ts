@@ -7,21 +7,13 @@ export class SubtitleRenderer {
 
   private translatedWrapper: HTMLDivElement | null = null;
 
+  private originalLine: HTMLDivElement | null = null;
+
   private translatedLine: HTMLDivElement | null = null;
 
   private latestTranslation = "";
 
-  private latestSource = "";
-
-  private sourceLine: HTMLDivElement | null = null;
-
-  private hideStyleElement: HTMLStyleElement | null = null;
-
-  private lastNativeHiddenLogAt = 0;
-
-  private dragOffsetX = 0;
-
-  private dragOffsetY = 0;
+  private latestOriginal: string | undefined;
 
   private dragActive = false;
 
@@ -33,11 +25,9 @@ export class SubtitleRenderer {
 
   private dragOriginOffsetY = 0;
 
-  private lastAppliedTop: number | null = null;
+  private dragLockedTop: number | null = null;
 
-  private scopedObserver: MutationObserver | null = null;
-
-  private observedCaptionRoot: HTMLElement | null = null;
+  private dragLockedLeft: number | null = null;
 
   observeNativeCaptions(): void {
     if (this.observer) {
@@ -57,19 +47,28 @@ export class SubtitleRenderer {
     this.scheduleSync();
   }
 
-  setTranslation(translation: string, source?: string): void {
+  setTranslation(translation: string, original?: string): void {
     this.latestTranslation = translation.trim();
-    this.latestSource = source?.trim() ?? "";
+    this.latestOriginal = original?.trim() || undefined;
     this.observeNativeCaptions();
     this.scheduleSync();
   }
 
   hide(): void {
     this.latestTranslation = "";
-    this.latestSource = "";
-    this.restoreNativeCaptions();
+    this.latestOriginal = undefined;
     if (this.translatedWrapper) {
       this.translatedWrapper.style.display = "none";
+    }
+    this.restoreNativeCaptions();
+  }
+
+  private restoreNativeCaptions(): void {
+    const captionRoot = this.findNativeCaptionContainer();
+    if (!captionRoot) return;
+    const windows = captionRoot.querySelectorAll<HTMLElement>(".caption-window");
+    for (const win of windows) {
+      win.style.opacity = "";
     }
   }
 
@@ -78,16 +77,9 @@ export class SubtitleRenderer {
     this.unbindDragEvents();
     this.observer?.disconnect();
     this.observer = null;
-    this.scopedObserver?.disconnect();
-    this.scopedObserver = null;
-    this.observedCaptionRoot = null;
-    this.restoreNativeCaptions();
     this.detachTranslatedWrapper();
-    this.hideStyleElement?.remove();
-    this.hideStyleElement = null;
     this.nativeCaptionContainer = null;
     this.latestTranslation = "";
-    this.latestSource = "";
   }
 
   private scheduleSync(): void {
@@ -115,57 +107,31 @@ export class SubtitleRenderer {
       this.nativeCaptionContainer = playerHost;
     }
 
-    // Narrow MutationObserver scope once caption container is found.
-    if (captionRoot && captionRoot !== this.observedCaptionRoot) {
-      this.narrowObserverScope(captionRoot, playerHost);
-    } else if (!captionRoot && this.observedCaptionRoot) {
-      // Caption container lost (e.g. ad transition); fall back to body observer.
-      this.scopedObserver?.disconnect();
-      this.scopedObserver = null;
-      this.observedCaptionRoot = null;
-      this.observeNativeCaptions();
-    }
-
     this.ensureTranslatedNode();
     if (!this.translatedWrapper || !this.translatedLine) {
       return;
     }
 
-    const hasSource = Boolean(this.latestSource);
-    const hasNativeCaption = captionRoot ? this.hasVisibleNativeCaption(captionRoot) : false;
+    // Use caller-provided original text if available, otherwise extract from native captions
+    const originalText = this.latestOriginal ??
+      (captionRoot ? this.extractNativeCaptionText(captionRoot) : "");
+    const hasOriginal = Boolean(originalText);
     const hasTranslation = Boolean(this.latestTranslation);
+
+    if (this.originalLine) {
+      this.originalLine.textContent = originalText;
+      this.originalLine.style.display = originalText ? "block" : "none";
+    }
     this.translatedLine.textContent = this.latestTranslation;
 
-    // Show resegmented source and hide native captions when source is available.
-    if (this.sourceLine) {
-      if (hasSource) {
-        this.sourceLine.textContent = this.latestSource;
-        this.sourceLine.style.display = "inline-block";
+    if (hasTranslation || hasOriginal) {
+      this.translatedWrapper.style.display = "flex";
+      if (captionRoot) {
         this.hideNativeCaptions(captionRoot);
-      } else {
-        this.sourceLine.textContent = "";
-        this.sourceLine.style.display = "none";
-        this.restoreNativeCaptions();
       }
     }
 
-    if (hasTranslation) {
-      // Ensure measurable box metrics before positioning.
-      this.translatedWrapper.style.display = "flex";
-    }
-    if (!hasNativeCaption && !hasSource && hasTranslation) {
-      const now = Date.now();
-      if (now - this.lastNativeHiddenLogAt > 3000) {
-        this.lastNativeHiddenLogAt = now;
-        console.warn(
-          "[AI Translator][phase:render_blocked_by_native_caption]",
-          "native caption is not visible, fallback to show translated subtitle"
-        );
-      }
-    }
-    // Some videos use different caption segment visibility rules.
-    // Keep translated subtitle visible as long as we have text.
-    this.positionWrapper(playerHost, captionRoot, hasNativeCaption);
+    this.positionWrapper(playerHost, captionRoot, hasOriginal);
     this.translatedWrapper.style.display = hasTranslation ? "flex" : "none";
   }
 
@@ -188,64 +154,25 @@ export class SubtitleRenderer {
     return null;
   }
 
-  private narrowObserverScope(captionRoot: HTMLElement, playerHost: HTMLElement): void {
-    this.observer?.disconnect();
-    this.observer = null;
-    this.scopedObserver?.disconnect();
-    this.scopedObserver = new MutationObserver(() => this.scheduleSync());
-    this.scopedObserver.observe(captionRoot, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["style", "class", "aria-hidden"]
-    });
-    this.scopedObserver.observe(playerHost, {
-      attributes: true,
-      attributeFilter: ["style", "class"]
-    });
-    this.observedCaptionRoot = captionRoot;
-  }
-
-  private ensureHideStyle(): void {
-    if (this.hideStyleElement?.isConnected) {
-      return;
-    }
-    const style = document.createElement("style");
-    style.textContent =
-      ".ai-translator-native-hidden > * { visibility: hidden !important; }";
-    (document.head ?? document.documentElement).appendChild(style);
-    this.hideStyleElement = style;
-  }
-
-  private hideNativeCaptions(captionRoot: HTMLElement | null): void {
-    if (!captionRoot) {
-      return;
-    }
-    this.ensureHideStyle();
-    captionRoot.classList.add("ai-translator-native-hidden");
-  }
-
-  private restoreNativeCaptions(): void {
-    const captionRoot = this.findNativeCaptionContainer();
-    if (!captionRoot) {
-      return;
-    }
-    captionRoot.classList.remove("ai-translator-native-hidden");
-  }
-
-  private hasVisibleNativeCaption(container: HTMLElement): boolean {
+  private extractNativeCaptionText(container: HTMLElement): string {
     const segments = container.querySelectorAll<HTMLElement>(".ytp-caption-segment");
-    if (segments.length === 0) {
-      return false;
-    }
-    return Array.from(segments).some((segment) => {
+    const texts: string[] = [];
+    for (const segment of segments) {
       const text = segment.textContent?.trim() ?? "";
-      if (!text) {
-        return false;
-      }
+      if (!text) continue;
       const style = window.getComputedStyle(segment);
-      return style.display !== "none" && style.visibility !== "hidden";
-    });
+      if (style.display !== "none" && style.visibility !== "hidden") {
+        texts.push(text);
+      }
+    }
+    return texts.join(" ");
+  }
+
+  private hideNativeCaptions(container: HTMLElement): void {
+    const windows = container.querySelectorAll<HTMLElement>(".caption-window");
+    for (const win of windows) {
+      win.style.opacity = "0";
+    }
   }
 
   private ensureTranslatedNode(): void {
@@ -274,106 +201,105 @@ export class SubtitleRenderer {
     if (hostStyle.position === "static") {
       this.nativeCaptionContainer.style.position = "relative";
     }
-    wrapper.style.width = "calc(100% - 24px)";
-    wrapper.style.maxWidth = "960px";
+    // Outer wrapper: centered like snowcc
+    wrapper.style.textAlign = "center";
+    wrapper.style.width = "fit-content";
+    wrapper.style.maxWidth = "90%";
+    wrapper.style.margin = "0 auto";
     wrapper.style.display = "none";
-    wrapper.style.flexDirection = "column";
-    wrapper.style.alignItems = "center";
-    wrapper.style.gap = "4px";
-    wrapper.style.marginTop = "0";
     wrapper.style.pointerEvents = "auto";
     wrapper.style.position = "absolute";
-    // Only set initial top/left on first creation; positionWrapper() manages them afterwards.
-    if (!wrapper.isConnected) {
-      wrapper.style.left = "12px";
-      wrapper.style.top = "56px";
-    }
+    wrapper.style.left = "0";
+    wrapper.style.right = "0";
+    wrapper.style.top = "56px";
     wrapper.style.bottom = "auto";
-    wrapper.style.transform = "none";
     wrapper.style.zIndex = "2147483000";
-    wrapper.style.transition = this.dragActive ? "none" : "top 0.15s ease-out";
+    wrapper.style.userSelect = "text";
+    wrapper.style.transition = "bottom 50ms ease-in-out";
 
-    // Source line (resegmented original text, shown above translation for ASR).
-    let srcLine =
-      this.sourceLine &&
-      this.sourceLine.isConnected &&
-      this.sourceLine.parentElement === wrapper
-        ? this.sourceLine
-        : wrapper.querySelector<HTMLDivElement>(".ai-translator-yt-source-line");
-
-    if (!srcLine) {
-      srcLine = document.createElement("div");
-      srcLine.className = "ai-translator-yt-source-line";
-      wrapper.appendChild(srcLine);
+    // Inner content box (snowcc-body style)
+    let contentBox =
+      wrapper.querySelector<HTMLDivElement>(".ai-translator-yt-content-box");
+    if (!contentBox) {
+      contentBox = document.createElement("div");
+      contentBox.className = "ai-translator-yt-content-box";
+      wrapper.appendChild(contentBox);
     }
 
-    srcLine.style.color = "#ffffff";
-    srcLine.style.fontSize = "18px";
-    srcLine.style.fontWeight = "400";
-    srcLine.style.lineHeight = "1.35";
-    srcLine.style.textAlign = "center";
-    srcLine.style.padding = "4px 14px";
-    srcLine.style.borderRadius = "6px";
-    srcLine.style.background = "rgba(0, 0, 0, 0.55)";
-    srcLine.style.display = "none";
-    srcLine.style.maxWidth = "88%";
-    srcLine.style.whiteSpace = "nowrap";
-    srcLine.style.overflow = "hidden";
-    srcLine.style.textOverflow = "ellipsis";
-    srcLine.style.textShadow = "0 1px 2px rgba(0, 0, 0, 0.85)";
-    srcLine.style.boxSizing = "border-box";
+    contentBox.style.background = "rgba(0, 0, 0, 0.7)";
+    contentBox.style.backdropFilter = "blur(10px)";
+    contentBox.style.setProperty("-webkit-backdrop-filter", "blur(10px)");
+    contentBox.style.borderRadius = "10px";
+    contentBox.style.padding = "10px";
+    contentBox.style.display = "inline-block";
+    contentBox.style.maxWidth = "100%";
+    contentBox.style.boxSizing = "border-box";
+    contentBox.style.cursor = this.dragActive ? "grabbing" : "grab";
+    contentBox.style.fontSize = "18px";
+    contentBox.onmousedown = (event: MouseEvent) => this.startDrag(event);
 
-    // Translation line.
+    // Original text line (english-subtitle style)
+    let origLine =
+      this.originalLine &&
+      this.originalLine.isConnected &&
+      this.originalLine.parentElement === contentBox
+        ? this.originalLine
+        : contentBox.querySelector<HTMLDivElement>(".ai-translator-yt-original-line");
+
+    if (!origLine) {
+      origLine = document.createElement("div");
+      origLine.className = "ai-translator-yt-original-line";
+      contentBox.appendChild(origLine);
+    }
+
+    origLine.style.color = "#ffffff";
+    origLine.style.fontSize = "20px";
+    origLine.style.fontWeight = "400";
+    origLine.style.lineHeight = "1.4";
+    origLine.style.textAlign = "center";
+    origLine.style.whiteSpace = "pre-wrap";
+    origLine.style.wordBreak = "break-word";
+    origLine.style.filter = "drop-shadow(1.41px 1.41px 3px rgba(0, 0, 0, 0.3))";
+    origLine.style.marginBottom = "5px";
+
+    // Translation line (chinese-subtitle style)
     let line =
       this.translatedLine &&
       this.translatedLine.isConnected &&
-      this.translatedLine.parentElement === wrapper
+      this.translatedLine.parentElement === contentBox
         ? this.translatedLine
-        : wrapper.querySelector<HTMLDivElement>(".ai-translator-yt-translation-line");
+        : contentBox.querySelector<HTMLDivElement>(".ai-translator-yt-translation-line");
 
     if (!line) {
       line = document.createElement("div");
       line.className = "ai-translator-yt-translation-line";
-      wrapper.appendChild(line);
+      contentBox.appendChild(line);
     }
 
-    // Ensure source line comes before translation line in DOM order.
-    if (srcLine.nextSibling !== line) {
-      wrapper.insertBefore(srcLine, line);
-    }
-
-    line.style.color = "#ffcc40";
-    line.style.fontSize = "20px";
-    line.style.fontWeight = "500";
-    line.style.lineHeight = "1.35";
+    line.style.color = "#ffffff";
+    line.style.fontSize = "18px";
+    line.style.fontWeight = "400";
+    line.style.lineHeight = "1.4";
     line.style.textAlign = "center";
-    line.style.padding = "4px 14px";
-    line.style.border = "2px solid #ff6644";
-    line.style.borderRadius = "8px";
-    line.style.background = "rgba(0, 0, 0, 0.55)";
-    line.style.display = "inline-block";
-    line.style.maxWidth = "88%";
     line.style.whiteSpace = "pre-wrap";
     line.style.wordBreak = "break-word";
-    line.style.textShadow = "0 1px 2px rgba(0, 0, 0, 0.85)";
+    line.style.filter = "drop-shadow(1.41px 1.41px 3px rgba(0, 0, 0, 0.3))";
     line.style.boxSizing = "border-box";
-    line.style.cursor = this.dragActive ? "grabbing" : "grab";
-    line.style.userSelect = "none";
-    line.onmousedown = (event: MouseEvent) => this.startDrag(event);
+
+    this.originalLine = origLine;
 
     if (!wrapper.isConnected) {
       this.nativeCaptionContainer.appendChild(wrapper);
     }
 
-    this.sourceLine = srcLine;
     this.translatedWrapper = wrapper;
     this.translatedLine = line;
   }
 
   private positionWrapper(
     playerHost: HTMLElement,
-    captionRoot: HTMLElement | null,
-    hasNativeCaption: boolean
+    _captionRoot: HTMLElement | null,
+    _hasNativeCaption: boolean
   ): void {
     if (!this.translatedWrapper) {
       return;
@@ -381,71 +307,37 @@ export class SubtitleRenderer {
     const playerRect = playerHost.getBoundingClientRect();
     const measuredWrapperHeight = this.translatedWrapper.getBoundingClientRect().height;
     const wrapperHeight = measuredWrapperHeight > 0 ? measuredWrapperHeight : 52;
-    const measuredWrapperWidth = this.translatedWrapper.getBoundingClientRect().width;
-    const wrapperWidth = measuredWrapperWidth > 0 ? measuredWrapperWidth : 420;
     const minTop = 16;
     const maxTop = Math.max(minTop, playerRect.height - wrapperHeight - 16);
-    const minLeft = 8;
-    const maxLeft = Math.max(minLeft, playerRect.width - wrapperWidth - 8);
-    const centeredLeft = (playerRect.width - wrapperWidth) / 2;
-    let topPx = maxTop - 44;
 
+    // If user has dragged, use locked absolute position
+    if (this.dragLockedTop !== null) {
+      const clampedTop = Math.max(minTop, Math.min(maxTop, this.dragLockedTop));
+      this.dragLockedTop = clampedTop;
+      this.translatedWrapper.style.top = "auto";
+      this.translatedWrapper.style.bottom = `${Math.round(playerRect.height - clampedTop - wrapperHeight)}px`;
+      if (this.dragLockedLeft !== null) {
+        this.translatedWrapper.style.left = `${Math.round(this.dragLockedLeft)}px`;
+        this.translatedWrapper.style.right = "auto";
+        this.translatedWrapper.style.margin = "0";
+      }
+      return;
+    }
+
+    // Position above the controls bar, like snowcc
+    const SUBTITLE_BOTTOM_SPACING = 14;
+    let bottomPx = SUBTITLE_BOTTOM_SPACING;
     const controls = playerHost.querySelector<HTMLElement>(".ytp-chrome-bottom");
     if (controls) {
-      const controlsRect = controls.getBoundingClientRect();
-      const controlsHeight = controlsRect.height > 0 ? controlsRect.height : 48;
-      topPx = playerRect.height - wrapperHeight - controlsHeight - 14;
+      const controlsHeight = controls.offsetHeight > 0 ? controls.offsetHeight : 48;
+      bottomPx = controlsHeight + SUBTITLE_BOTTOM_SPACING;
     }
 
-    // When source text is shown, native captions are hidden; skip segment tracking.
-    if (captionRoot && hasNativeCaption && !this.latestSource) {
-      const visibleSegments = Array.from(
-        captionRoot.querySelectorAll<HTMLElement>(".ytp-caption-segment")
-      ).filter((segment) => {
-        const text = segment.textContent?.trim() ?? "";
-        if (!text) {
-          return false;
-        }
-        const style = window.getComputedStyle(segment);
-        return style.display !== "none" && style.visibility !== "hidden";
-      });
-      if (visibleSegments.length > 0) {
-        const minSegmentTop = Math.min(
-          ...visibleSegments.map((segment) => segment.getBoundingClientRect().top)
-        );
-        const maxBottom = Math.max(
-          ...visibleSegments.map((segment) => segment.getBoundingClientRect().bottom)
-        );
-        const gap = 8;
-        const segmentTop = minSegmentTop - playerRect.top;
-        const segmentBottom = maxBottom - playerRect.top;
-        // Always place translated subtitle below native subtitle first.
-        topPx = segmentBottom + gap;
-        // If native subtitle is unusually high, keep translated subtitle from floating too high.
-        topPx = Math.max(topPx, segmentTop + 4);
-      }
-    }
-
-    const clampedTop = Math.max(minTop, Math.min(maxTop, topPx + this.dragOffsetY));
-    const clampedLeft = Math.max(
-      minLeft,
-      Math.min(maxLeft, centeredLeft + this.dragOffsetX)
-    );
-    this.dragOffsetX = clampedLeft - centeredLeft;
-    this.dragOffsetY = clampedTop - topPx;
-
-    const POSITION_THRESHOLD = 10;
-    const shouldUpdateTop =
-      this.dragActive ||
-      this.lastAppliedTop === null ||
-      Math.abs(clampedTop - this.lastAppliedTop) >= POSITION_THRESHOLD;
-
-    this.translatedWrapper.style.left = `${Math.round(clampedLeft)}px`;
-    if (shouldUpdateTop) {
-      this.translatedWrapper.style.top = `${Math.round(clampedTop)}px`;
-      this.lastAppliedTop = clampedTop;
-    }
-    this.translatedWrapper.style.bottom = "auto";
+    this.translatedWrapper.style.top = "auto";
+    this.translatedWrapper.style.bottom = `${bottomPx}px`;
+    this.translatedWrapper.style.left = "0";
+    this.translatedWrapper.style.right = "0";
+    this.translatedWrapper.style.margin = "0 auto";
   }
 
   private startDrag(event: MouseEvent): void {
@@ -456,13 +348,18 @@ export class SubtitleRenderer {
     this.dragActive = true;
     this.dragStartX = event.clientX;
     this.dragStartY = event.clientY;
-    this.dragOriginOffsetX = this.dragOffsetX;
-    this.dragOriginOffsetY = this.dragOffsetY;
+    // Capture current position as starting point
+    if (this.translatedWrapper) {
+      const rect = this.translatedWrapper.getBoundingClientRect();
+      const playerHost = this.findPlayerContainer();
+      if (playerHost) {
+        const playerRect = playerHost.getBoundingClientRect();
+        this.dragOriginOffsetX = rect.left - playerRect.left;
+        this.dragOriginOffsetY = rect.top - playerRect.top;
+      }
+    }
     if (this.translatedLine) {
       this.translatedLine.style.cursor = "grabbing";
-    }
-    if (this.translatedWrapper) {
-      this.translatedWrapper.style.transition = "none";
     }
     this.bindDragEvents();
   }
@@ -482,9 +379,6 @@ export class SubtitleRenderer {
     if (this.translatedLine) {
       this.translatedLine.style.cursor = "grab";
     }
-    if (this.translatedWrapper) {
-      this.translatedWrapper.style.transition = "top 0.15s ease-out";
-    }
   }
 
   private readonly handleDragMove = (event: MouseEvent): void => {
@@ -493,8 +387,8 @@ export class SubtitleRenderer {
     }
     const dx = event.clientX - this.dragStartX;
     const dy = event.clientY - this.dragStartY;
-    this.dragOffsetX = this.dragOriginOffsetX + dx;
-    this.dragOffsetY = this.dragOriginOffsetY + dy;
+    this.dragLockedLeft = this.dragOriginOffsetX + dx;
+    this.dragLockedTop = this.dragOriginOffsetY + dy;
     this.scheduleSync();
   };
 
@@ -507,11 +401,9 @@ export class SubtitleRenderer {
   };
 
   private detachTranslatedWrapper(): void {
-    this.restoreNativeCaptions();
     this.translatedWrapper?.remove();
     this.translatedWrapper = null;
+    this.originalLine = null;
     this.translatedLine = null;
-    this.sourceLine = null;
-    this.lastAppliedTop = null;
   }
 }

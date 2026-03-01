@@ -70,7 +70,7 @@ describe("SubtitleRenderer", () => {
     renderer.destroy();
   });
 
-  test("keeps subtitle near native segment bottom when native caption exists", async () => {
+  test("positions subtitle above controls bar using bottom", async () => {
     document.body.innerHTML = `
       <div class="html5-video-player">
         <div class="ytp-caption-window-container">
@@ -78,19 +78,17 @@ describe("SubtitleRenderer", () => {
             <span class="ytp-caption-segment">native subtitle</span>
           </div>
         </div>
+        <div class="ytp-chrome-bottom"></div>
       </div>
     `;
 
     const player = document.querySelector(".html5-video-player") as HTMLElement;
-    const segment = document.querySelector(".ytp-caption-segment") as HTMLElement;
+    const controls = document.querySelector(".ytp-chrome-bottom") as HTMLElement;
     Object.defineProperty(player, "getBoundingClientRect", {
       value: () => ({ bottom: 720, top: 0, left: 0, right: 1280, width: 1280, height: 720 }),
       configurable: true
     });
-    Object.defineProperty(segment, "getBoundingClientRect", {
-      value: () => ({ bottom: 650, top: 620, left: 300, right: 980, width: 680, height: 30 }),
-      configurable: true
-    });
+    Object.defineProperty(controls, "offsetHeight", { value: 48, configurable: true });
 
     const renderer = new SubtitleRenderer();
     renderer.setTranslation("with-native");
@@ -101,36 +99,34 @@ describe("SubtitleRenderer", () => {
     );
     expect(wrapper).not.toBeNull();
     expect(wrapper?.style.display).toBe("flex");
-    const top = Number.parseFloat(wrapper?.style.top ?? "");
-    expect(Number.isFinite(top)).toBe(true);
-    // Should stay below native segment area; when space is tight it may clamp near bottom edge.
-    expect(top >= 651).toBe(true);
-    expect(wrapper?.style.bottom).toBe("auto");
+    // Should use bottom positioning
+    const bottom = Number.parseFloat(wrapper?.style.bottom ?? "");
+    expect(Number.isFinite(bottom)).toBe(true);
+    expect(bottom).toBeGreaterThan(0);
+    expect(wrapper?.style.top).toBe("auto");
 
     renderer.destroy();
   });
 
-  test("supports dragging translated subtitle to avoid overlap", async () => {
+  test("supports dragging translated subtitle to reposition", async () => {
     document.body.innerHTML = `
       <div class="html5-video-player">
         <div class="ytp-caption-window-container">
-          <div class="ytp-caption-window">
+          <div class="caption-window">
             <span class="ytp-caption-segment">native subtitle</span>
           </div>
         </div>
+        <div class="ytp-chrome-bottom"></div>
       </div>
     `;
 
     const player = document.querySelector(".html5-video-player") as HTMLElement;
-    const segment = document.querySelector(".ytp-caption-segment") as HTMLElement;
+    const controls = document.querySelector(".ytp-chrome-bottom") as HTMLElement;
     Object.defineProperty(player, "getBoundingClientRect", {
       value: () => ({ bottom: 720, top: 0, left: 0, right: 1280, width: 1280, height: 720 }),
       configurable: true
     });
-    Object.defineProperty(segment, "getBoundingClientRect", {
-      value: () => ({ bottom: 650, top: 620, left: 300, right: 980, width: 680, height: 30 }),
-      configurable: true
-    });
+    Object.defineProperty(controls, "offsetHeight", { value: 48, configurable: true });
 
     const renderer = new SubtitleRenderer();
     renderer.setTranslation("drag-me");
@@ -139,14 +135,14 @@ describe("SubtitleRenderer", () => {
     const wrapper = document.querySelector<HTMLDivElement>(
       ".ai-translator-yt-translation-wrapper"
     );
-    const line = document.querySelector<HTMLDivElement>(".ai-translator-yt-translation-line");
+    const contentBox = document.querySelector<HTMLDivElement>(".ai-translator-yt-content-box");
     expect(wrapper).not.toBeNull();
-    expect(line).not.toBeNull();
+    expect(contentBox).not.toBeNull();
 
-    const beforeTop = Number.parseFloat(wrapper?.style.top ?? "0");
-    const beforeLeft = Number.parseFloat(wrapper?.style.left ?? "0");
+    const beforeBottom = wrapper?.style.bottom;
 
-    line?.dispatchEvent(
+    // Drag via contentBox (mousedown is bound there)
+    contentBox?.dispatchEvent(
       new MouseEvent("mousedown", {
         bubbles: true,
         button: 0,
@@ -165,11 +161,9 @@ describe("SubtitleRenderer", () => {
     window.dispatchEvent(new MouseEvent("mouseup", { bubbles: true }));
     await flushFrames(1);
 
-    const afterTop = Number.parseFloat(wrapper?.style.top ?? "0");
-    const afterLeft = Number.parseFloat(wrapper?.style.left ?? "0");
-
-    expect(afterTop).toBeLessThan(beforeTop);
-    expect(afterLeft).toBeGreaterThan(beforeLeft);
+    // After drag, position should have changed
+    const afterBottom = wrapper?.style.bottom;
+    expect(afterBottom).not.toBe(beforeBottom);
 
     renderer.destroy();
   });

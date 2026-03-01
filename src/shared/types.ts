@@ -155,3 +155,10 @@ export interface SubtitleCue {
   end: number;
   text: string;
 }
+
+export interface SentenceSegment {
+  startTime: number;
+  endTime: number;
+  originalText: string;
+  translatedText?: string;
+}

@@ -16,6 +16,7 @@ import type {
   PageTranslationStatus,
   RuntimeRequestMessage,
   RuntimeResponseMessage,
+  SentenceSegment,
   SubtitleCue,
   TranslationPortOutgoingMessage,
   YouTubeCaptionTrack
@@ -265,7 +266,9 @@ export class YouTubeSubtitleTranslator {
 
   private readonly translations = new Map<number, string>();
 
-  private readonly sourceTexts = new Map<number, string>();
+  private isAsrMode = false;
+
+  private readonly sentenceSegments: SentenceSegment[] = [];
 
   private readonly pendingBatches = new Map<string, PendingBatch>();
 
@@ -756,22 +759,15 @@ export class YouTubeSubtitleTranslator {
     }
 
     const shouldResegment = preferredTrack.kind === "asr" && cues.length >= 5;
-    console.log(
-      LOG_PREFIX,
-      "[phase:track_decision]",
-      "kind:", preferredTrack.kind,
-      "isAsr:", preferredTrack.kind === "asr",
-      "cueCount:", cues.length,
-      "shouldResegment:", shouldResegment
-    );
     if (shouldResegment) {
       console.log(
         LOG_PREFIX,
         "ASR track detected, processing by playback stages (resegment+translate)..."
       );
+      this.isAsrMode = true;
+      this.sentenceSegments.length = 0;
       this.cues.splice(0, this.cues.length, ...cues);
       this.translations.clear();
-      this.sourceTexts.clear();
       this.lastError = undefined;
       this.progress.total = cues.length;
       this.progress.translated = 0;
@@ -792,7 +788,6 @@ export class YouTubeSubtitleTranslator {
     this.progress.inflight = 0;
     this.progress.pending = cues.length;
     this.translations.clear();
-    this.sourceTexts.clear();
     this.pendingHint = "翻译中...";
     // 先开始按时间渲染，让用户立刻看到“翻译中...”，翻译在后台逐批完成。
     this.startSync();
@@ -805,7 +800,8 @@ export class YouTubeSubtitleTranslator {
     this.stopSync();
     this.cues.length = 0;
     this.translations.clear();
-    this.sourceTexts.clear();
+    this.isAsrMode = false;
+    this.sentenceSegments.length = 0;
     this.progress.total = 0;
     this.progress.translated = 0;
     this.progress.inflight = 0;
@@ -911,9 +907,13 @@ export class YouTubeSubtitleTranslator {
   ): {
     items: BatchTranslationItem[];
     rangeByItemId: Map<string, { start: number; end: number }>;
+    segmentByItemId: Map<string, SentenceSegment>;
   } {
     const items: BatchTranslationItem[] = [];
     const rangeByItemId = new Map<string, { start: number; end: number }>();
+    const segmentByItemId = new Map<string, SentenceSegment>();
+
+    // Build SentenceSegments from ranges
     for (let i = 0; i < ranges.length; i += 1) {
       const range = ranges[i];
       if (!range.text.trim()) {
@@ -921,6 +921,19 @@ export class YouTubeSubtitleTranslator {
       }
       const absoluteStart = absoluteStageStart + range.startIndex;
       const absoluteEnd = absoluteStageStart + range.endIndex;
+      const firstCue = this.cues[absoluteStart];
+      const lastCue = this.cues[absoluteEnd];
+      if (!firstCue || !lastCue) {
+        continue;
+      }
+
+      const segment: SentenceSegment = {
+        startTime: firstCue.start,
+        endTime: lastCue.end > firstCue.start ? lastCue.end : firstCue.start + firstCue.duration,
+        originalText: range.text
+      };
+      this.sentenceSegments.push(segment);
+
       const context = this.getContext(absoluteStart);
       const id = String(i);
       items.push({
@@ -933,10 +946,26 @@ export class YouTubeSubtitleTranslator {
         start: absoluteStart,
         end: absoluteEnd
       });
+      segmentByItemId.set(id, segment);
     }
+
+    // Sort segments by startTime for binary search
+    this.sentenceSegments.sort((a, b) => a.startTime - b.startTime);
+
+    // Remove overlaps between adjacent segments so binary search works correctly.
+    // Gaps are kept — they represent silence or transitions with no subtitle.
+    for (let i = 0; i < this.sentenceSegments.length - 1; i += 1) {
+      const cur = this.sentenceSegments[i];
+      const next = this.sentenceSegments[i + 1];
+      if (cur.endTime > next.startTime) {
+        cur.endTime = next.startTime;
+      }
+    }
+
     return {
       items,
-      rangeByItemId
+      rangeByItemId,
+      segmentByItemId
     };
   }
 
@@ -990,7 +1019,8 @@ export class YouTubeSubtitleTranslator {
         }
       }
 
-      const { items, rangeByItemId } = this.buildResegmentStageItems(ranges, stage.start);
+      const { items, rangeByItemId, segmentByItemId } =
+        this.buildResegmentStageItems(ranges, stage.start);
       if (items.length === 0) {
         continue;
       }
@@ -1011,6 +1041,14 @@ export class YouTubeSubtitleTranslator {
 
           for (const item of batchItems) {
             const value = translated[item.id] ?? item.text;
+
+            // Write translation to SentenceSegment (direct reference, safe after sort)
+            const seg = segmentByItemId.get(item.id);
+            if (seg) {
+              seg.translatedText = value;
+            }
+
+            // Also maintain cue-level translations for progress tracking
             const mapped = rangeByItemId.get(item.id);
             if (!mapped) {
               continue;
@@ -1020,7 +1058,6 @@ export class YouTubeSubtitleTranslator {
                 this.progress.translated += 1;
               }
               this.translations.set(index, value);
-              this.sourceTexts.set(index, item.text);
             }
           }
         }
@@ -1119,6 +1156,24 @@ export class YouTubeSubtitleTranslator {
     return null;
   }
 
+  private findSegmentByTime(currentTime: number): SentenceSegment | null {
+    const segments = this.sentenceSegments;
+    let left = 0;
+    let right = segments.length - 1;
+    while (left <= right) {
+      const mid = Math.floor((left + right) / 2);
+      const seg = segments[mid];
+      if (currentTime < seg.startTime) {
+        right = mid - 1;
+      } else if (currentTime > seg.endTime) {
+        left = mid + 1;
+      } else {
+        return seg;
+      }
+    }
+    return null;
+  }
+
   private syncSubtitleByTime(): void {
     if (!this.enabled || this.cues.length === 0) {
       this.renderer.hide();
@@ -1131,6 +1186,25 @@ export class YouTubeSubtitleTranslator {
       return;
     }
 
+    if (this.isAsrMode) {
+      const segment = this.findSegmentByTime(video.currentTime);
+      if (!segment) {
+        // No segment covers current time yet — check if we're within a cue range
+        // (segments may not be built yet for this time range)
+        const found = this.findCueByTime(video.currentTime);
+        if (found) {
+          this.renderer.setTranslation(this.pendingHint);
+        } else {
+          this.renderer.hide();
+        }
+        return;
+      }
+      const translated = segment.translatedText ??
+        (this.lastError ? `翻译失败：${this.lastError}` : this.pendingHint);
+      this.renderer.setTranslation(translated, segment.originalText);
+      return;
+    }
+
     const found = this.findCueByTime(video.currentTime);
     if (!found) {
       this.renderer.hide();
@@ -1140,8 +1214,7 @@ export class YouTubeSubtitleTranslator {
     const translated =
       this.translations.get(found.index) ??
       (this.lastError ? `翻译失败：${this.lastError}` : this.pendingHint);
-    const source = this.sourceTexts.get(found.index);
-    this.renderer.setTranslation(translated, source);
+    this.renderer.setTranslation(translated);
   }
 }
 

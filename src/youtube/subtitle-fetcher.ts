@@ -244,6 +244,15 @@ function parseJson3(data: Json3Response): SubtitleCue[] {
     });
   }
 
+  // Cap default-duration cues at the next cue's start to prevent overlap
+  for (let i = 0; i < cues.length - 1; i += 1) {
+    const nextStart = cues[i + 1].start;
+    if (cues[i].end > nextStart) {
+      cues[i].end = nextStart;
+      cues[i].duration = cues[i].end - cues[i].start;
+    }
+  }
+
   return cues;
 }
 
